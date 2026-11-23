@@ -26,10 +26,14 @@
 #include "sh/flash.h"
 #include "sh/full.h"
 #include "sh/haze.h"
+#include "sh/lamp.h"
 #include "sh/near.h"
 #include "sh/nearblock.h"
 #include "sh/noise.h"
 #include "sh/pick.h"
+#include "sh/prop.h"
+#include "sh/propin.h"
+#include "sh/propvs.h"
 #include "sh/rain.h"
 #include "sh/scatter.h"
 #include "sh/shade.h"
@@ -85,6 +89,32 @@ struct BoltC {
   float seg[BOLT_MAX][4];
   float par[BOLT_MAX][4];
 };
+
+// The same order as cbuffer PropC in shader\sky.hlsl.
+struct PropC {
+  float row[3][4];
+  float rect[4];
+  float depth[4];
+  float work[4];
+  float air[4];
+  float light[4];
+  float wing[4];
+  float axis[4];
+};
+
+// A model as it is in the resources: this head, then the vertices (position,
+// normal as three signed bytes and one that marks thin material, texture
+// position, color factor with the layer of the material in a: 28 bytes), then
+// the indices with 32 bits, then the lamps. Written by tools\models\convert.py.
+struct MeshHead {
+  char magic[4];   // SBM2
+  uint32_t vertices, indices, layers;
+  float lo[3], hi[3];
+  float wing[3];
+  uint32_t lamps;
+};
+const UINT MESH_VERTEX = 28;
+static_assert(sizeof(MeshHead) == 56 && sizeof(Lamp) == 52);
 
 // The same order as cbuffer LightC in shader\light.hlsl.
 struct LightC {
@@ -173,6 +203,28 @@ const int AIR_BANDS = int(std::size(AIR_CUTS)) - 1;
 // night.
 const double NIGHT_DEPTH = 18;
 const double CLOUD_LEVEL = 2600, CIRRUS_LEVEL = 9000;   // altitude of the cloud layers in meters, as in sky.hlsl
+
+// What moves through the image, in the order of life.h. afloat: it lies in the
+// water, what is below the water line is cut off, and the clouds shade it like
+// the water around it.
+struct Model {
+  const wchar_t* mesh;
+  const wchar_t* colors;
+  bool afloat;
+  float gloss;   // how strongly its surface shows the light source as a highlight
+};
+const Model MODELS[MODEL_COUNT] = {
+    {L"MODEL_CONTAINER", L"MODEL_CONTAINER_COLORS", true, 0.12f}, {L"MODEL_FREIGHTER", L"MODEL_FREIGHTER_COLORS", true, 0.12f},
+    {L"MODEL_DINGHY", L"MODEL_DINGHY_COLORS", true, 0.08f},       {L"MODEL_AIRLINER", L"MODEL_AIRLINER_COLORS", false, 0.5f},
+    {L"MODEL_GULL", L"MODEL_GULL_COLORS", false, 0.0f},
+};
+// The work image for one model. If the model is smaller in the image, several of
+// its pixels fall on one pixel of the image, up to PROP_FINE per axis.
+const int PROP_W = 768, PROP_H = 512, PROP_FINE = 4;
+// A lamp of strength 1 at one kilometer is this bright in its center, as a
+// multiple of white before exposure; LAMP_PEAK is the most a disc holds.
+const double LAMP_GAIN = 300, LAMP_PEAK = 6;
+const double R_EFF = 7433e3;   // Earth radius, enlarged to account for refraction, as in ground.hlsli
 
 const double R_PLANET = 6371e3;
 const double R_ATMOS = 6471e3;
@@ -324,9 +376,9 @@ bool resource(const wchar_t* name, const uint8_t*& data, size_t& size) {
   return data != nullptr;
 }
 
-// An image from a PNG resource as a texture with all mip levels.
-// deep: 16 bits per channel; colour: color values that become linear when read.
-bool pngTexture(ID3D11Device* dev, const wchar_t* name, bool deep, bool colour, ComPtr<ID3D11ShaderResourceView>& out) {
+// The pixels of an image from a PNG resource: RGBA, row by row from the top.
+// deep: 16 bits per channel.
+bool pngPixels(const wchar_t* name, bool deep, UINT& w, UINT& h, std::vector<uint8_t>& px) {
   const uint8_t* data;
   size_t size;
   if (!resource(name, data, size)) return false;
@@ -345,13 +397,21 @@ bool pngTexture(ID3D11Device* dev, const wchar_t* name, bool deep, bool colour, 
     hr = rgba->Initialize(frame.Get(), deep ? GUID_WICPixelFormat64bppRGBA : GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
                           WICBitmapPaletteTypeCustom);
   }
-  UINT w = 0, h = 0;
+  w = h = 0;
   if (SUCCEEDED(hr)) hr = rgba->GetSize(&w, &h);
   if (FAILED(hr) || !w || !h) return false;
   const UINT bytes = deep ? 8 : 4;
-  std::vector<std::vector<uint8_t>> levels;
-  levels.emplace_back(size_t(w) * h * bytes);
-  if (FAILED(rgba->CopyPixels(nullptr, w * bytes, UINT(levels[0].size()), levels[0].data()))) return false;
+  px.resize(size_t(w) * h * bytes);
+  return SUCCEEDED(rgba->CopyPixels(nullptr, w * bytes, UINT(px.size()), px.data()));
+}
+
+// An image from a PNG resource as a texture with all mip levels.
+// deep: 16 bits per channel; colour: color values that become linear when read.
+bool pngTexture(ID3D11Device* dev, const wchar_t* name, bool deep, bool colour, ComPtr<ID3D11ShaderResourceView>& out) {
+  UINT w = 0, h = 0;
+  const UINT bytes = deep ? 8 : 4;
+  std::vector<std::vector<uint8_t>> levels(1);
+  if (!pngPixels(name, deep, w, h, levels[0])) return false;
   std::vector<D3D11_SUBRESOURCE_DATA> init = {{nullptr, w * bytes, 0}};
   for (UINT lw = w, lh = h; lw > 1 && lh > 1;) {
     UINT nw = lw / 2, nh = lh / 2;
@@ -406,6 +466,14 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   hr |= dev_->CreateVertexShader(sh_dustvs, sizeof(sh_dustvs), nullptr, &vsDust_);
   hr |= dev_->CreateVertexShader(sh_boltvs, sizeof(sh_boltvs), nullptr, &vsBolt_);
   hr |= dev_->CreateVertexShader(sh_boltfarvs, sizeof(sh_boltfarvs), nullptr, &vsBoltFar_);
+  hr |= dev_->CreateVertexShader(sh_propvs, sizeof(sh_propvs), nullptr, &vsProp_);
+  const D3D11_INPUT_ELEMENT_DESC vertex[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"NORMAL", 0, DXGI_FORMAT_R8G8B8A8_SNORM, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+  };
+  hr |= dev_->CreateInputLayout(vertex, UINT(std::size(vertex)), sh_propvs, sizeof(sh_propvs), &propLayout_);
   auto pixel = [&](const BYTE* code, size_t size, ComPtr<ID3D11PixelShader>& out) {
     hr |= dev_->CreatePixelShader(code, size, nullptr, &out);
   };
@@ -430,6 +498,9 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   pixel(sh_composite, sizeof(sh_composite), psComposite_);
   pixel(sh_flash, sizeof(sh_flash), psFlash_);
   pixel(sh_dustps, sizeof(sh_dustps), psDust_);
+  pixel(sh_prop, sizeof(sh_prop), psProp_);
+  pixel(sh_propin, sizeof(sh_propin), psPropIn_);
+  pixel(sh_lamp, sizeof(sh_lamp), psLamp_);
   if (FAILED(hr)) return false;
 
   D3D11_SAMPLER_DESC sd = {};
@@ -463,6 +534,15 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   // The brighter of the two: for the segments of a lightning channel that overlap.
   rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_MAX;
   dev_->CreateBlendState(&bd, &blendMax_);
+  // Laid over the target by its coverage.
+  rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+  rt.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+  rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+  rt.SrcBlendAlpha = D3D11_BLEND_ZERO;
+  rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+  dev_->CreateBlendState(&bd, &blendOver_);
+  rt.DestBlendAlpha = D3D11_BLEND_ONE;
+  dev_->CreateBlendState(&bd, &blendOverKeep_);
 
   D3D11_RASTERIZER_DESC rd = {};
   rd.FillMode = D3D11_FILL_SOLID;
@@ -484,10 +564,15 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   buffer(sizeof(NoiseC), noiseBuf_);
   buffer(sizeof(WaveC), waveBuf_);
   buffer(sizeof(BoltC), boltBuf_);
+  buffer(sizeof(PropC), propBuf_);
 
   D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
   dev_->CreateQuery(&qd, &event_);
 
+  // A model that is missing or damaged simply never appears.
+  for (int i = 0; i < MODEL_COUNT; i++) {
+    if (!loadMesh(i)) mesh_[i] = Mesh();
+  }
   if (!loadClouds()) return false;
   bindCommon();
   makeNoise();
@@ -1957,6 +2042,300 @@ void Renderer::drawWaterMaps(bool sums, bool shade) {
   }
 }
 
+// A model from the resources: its mesh and its surface colors. The colors are
+// one image with the layers one below the other, each as high as it is wide.
+bool Renderer::loadMesh(int model) {
+  Mesh& m = mesh_[model];
+  const uint8_t* data;
+  size_t size;
+  MeshHead head;
+  if (!resource(MODELS[model].mesh, data, size) || size < sizeof(head)) return false;
+  memcpy(&head, data, sizeof(head));
+  size_t vertexBytes = size_t(head.vertices) * MESH_VERTEX, indexBytes = size_t(head.indices) * 4, lampBytes = size_t(head.lamps) * sizeof(Lamp);
+  if (memcmp(head.magic, "SBM2", 4) || !head.vertices || !head.indices || !head.layers ||
+      size < sizeof(head) + vertexBytes + indexBytes + lampBytes) {
+    return false;
+  }
+  m.lamps.resize(head.lamps);
+  if (head.lamps) memcpy(m.lamps.data(), data + sizeof(head) + vertexBytes + indexBytes, lampBytes);
+  D3D11_BUFFER_DESC b = {};
+  b.Usage = D3D11_USAGE_IMMUTABLE;
+  b.ByteWidth = UINT(vertexBytes);
+  b.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA from = {data + sizeof(head), 0, 0};
+  if (FAILED(dev_->CreateBuffer(&b, &from, &m.vertices))) return false;
+  b.ByteWidth = UINT(indexBytes);
+  b.BindFlags = D3D11_BIND_INDEX_BUFFER;
+  from.pSysMem = data + sizeof(head) + vertexBytes;
+  if (FAILED(dev_->CreateBuffer(&b, &from, &m.indices))) return false;
+
+  UINT w = 0, h = 0;
+  std::vector<uint8_t> px;
+  if (!pngPixels(MODELS[model].colors, false, w, h, px) || h != w * head.layers) return false;
+  UINT levels = 1;
+  while ((w >> levels) > 0) levels++;
+  D3D11_TEXTURE2D_DESC d = {};
+  d.Width = d.Height = w;
+  d.MipLevels = levels;
+  d.ArraySize = head.layers;
+  d.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  d.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+  ComPtr<ID3D11Texture2D> tex;
+  if (FAILED(dev_->CreateTexture2D(&d, nullptr, &tex))) return false;
+  for (UINT i = 0; i < head.layers; i++) {
+    ctx_->UpdateSubresource(tex.Get(), D3D11CalcSubresource(0, i, levels), nullptr, px.data() + size_t(i) * w * w * 4, w * 4, 0);
+  }
+  D3D11_SHADER_RESOURCE_VIEW_DESC v = {};
+  v.Format = d.Format;
+  v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  v.Texture2DArray.MipLevels = levels;
+  v.Texture2DArray.ArraySize = head.layers;
+  if (FAILED(dev_->CreateShaderResourceView(tex.Get(), &v, &m.colors))) return false;
+  ctx_->GenerateMips(m.colors.Get());
+  m.count = head.indices;
+  for (int i = 0; i < 3; i++) m.lo[i] = head.lo[i], m.hi[i] = head.hi[i], m.wing[i] = head.wing[i];
+  return true;
+}
+
+// The work image for the models, made when the first one appears: with as many
+// samples per pixel as the graphics card offers, up to eight.
+bool Renderer::allocProps() {
+  if (propSamples_ != 0) return propSamples_ > 0;
+  propSamples_ = -1;
+  UINT count = 8;
+  for (; count >= 2; count /= 2) {
+    UINT color = 0, depth = 0;
+    if (SUCCEEDED(dev_->CheckMultisampleQualityLevels(DXGI_FORMAT_R16G16B16A16_FLOAT, count, &color)) && color > 0 &&
+        SUCCEEDED(dev_->CheckMultisampleQualityLevels(DXGI_FORMAT_D32_FLOAT, count, &depth)) && depth > 0) {
+      break;
+    }
+  }
+  if (count < 2) return false;
+  D3D11_TEXTURE2D_DESC d = {};
+  d.Width = PROP_W;
+  d.Height = PROP_H;
+  d.MipLevels = 1;
+  d.ArraySize = 1;
+  d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  d.SampleDesc.Count = count;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(dev_->CreateTexture2D(&d, nullptr, &propColor_)) || FAILED(dev_->CreateRenderTargetView(propColor_.Get(), nullptr, &propRtv_)) ||
+      FAILED(dev_->CreateShaderResourceView(propColor_.Get(), nullptr, &propSrv_))) {
+    return false;
+  }
+  d.Format = DXGI_FORMAT_D32_FLOAT;
+  d.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+  if (FAILED(dev_->CreateTexture2D(&d, nullptr, &propDepth_)) || FAILED(dev_->CreateDepthStencilView(propDepth_.Get(), nullptr, &propDsv_))) return false;
+  propSamples_ = int(count);
+  return true;
+}
+
+// Ships, aircraft and birds, dt seconds later. Returns whether the image for the
+// eye has to show them or, one last time, to remove them.
+bool Renderer::updateLife(double dt) {
+  int index = groundOf(par_);
+  const Ground& g = GROUNDS[index];
+  Surroundings s;
+  s.ground = index;
+  s.water = g.water;
+  s.eye = g.eyeWater;
+  s.wind = surfSpeed() * (g.water ? g.shelter : 1.0f);
+  s.windX = SURF_X, s.windZ = SURF_Z;
+  s.night = light_.night;
+  s.rain = skyOf(par_.clouds).rain;
+  s.halfWidth = 0.5 * viewW_ / focal();
+  s.top = horizon() / focal();
+  s.amount = par_.life;
+  for (int i = 0; i < MODEL_COUNT; i++) {
+    const Mesh& m = mesh_[i];
+    s.has[i] = m.vertices != nullptr;
+    s.length[i] = std::max({m.hi[0] - m.lo[0], m.hi[1] - m.lo[1], m.hi[2] - m.lo[2]});
+  }
+  bool was = !props_.empty();
+  props_ = life_.update(dt, s);
+  return was || !props_.empty();
+}
+
+// Whether they have moved visibly since the image for the light was last made.
+bool Renderer::propsShifted() const {
+  if (props_.size() != lightProps_.size()) return true;
+  for (size_t i = 0; i < props_.size(); i++) {
+    const Prop& a = props_[i];
+    const Prop& b = lightProps_[i];
+    if (a.model != b.model || std::abs(a.wing - b.wing) > 0.05f) return true;
+    double dx = a.pos[0] / a.pos[2] - b.pos[0] / b.pos[2], dy = a.pos[1] / a.pos[2] - b.pos[1] / b.pos[2];
+    if (std::hypot(dx, dy) * focal() > 0.6) return true;
+  }
+  return false;
+}
+
+// Sets what moves through the image into a finished image: the target is rtv,
+// its values (SkyC) are set and the textures of sky and ground are bound. Each
+// model is first computed alone in the work image, then laid over the target.
+void Renderer::drawProps(Into into, ID3D11RenderTargetView* rtv, int w, int h) {
+  if (props_.empty() || !rtv || !allocProps()) return;
+  const Ground& g = GROUNDS[groundOf(par_)];
+  // The water mirrors a point as if it were seen from an eye that is as far below
+  // the water as the real one is above it. The water out there is tilted with the
+  // Earth, which triples the effect of the curvature. The image that is mirrored
+  // shows the models that way; for everything far away it makes no difference.
+  const bool mirror = into == Into::MIRROR;
+  const double eye = g.eyeWater, lift = mirror ? eye : -eye, curve = mirror ? 3 : 1;
+  const double f = focal(), hz = horizon(), density = double(w) / viewW_;
+  ID3D11ShaderResourceView* none[1] = {};
+  if (g.water) ctx_->PSSetShaderResources(23, 1, shade_.srv.GetAddressOf());
+  ctx_->VSSetConstantBuffers(0, 1, skyBuf_.GetAddressOf());
+  ctx_->VSSetConstantBuffers(3, 1, propBuf_.GetAddressOf());
+  ctx_->PSSetConstantBuffers(3, 1, propBuf_.GetAddressOf());
+  const D3D11_VIEWPORT whole = {0, 0, float(w), float(h), 0, 1};
+  for (const Prop& p : props_) {
+    const Mesh& m = mesh_[p.model];
+    const Model& model = MODELS[p.model];
+    if (!m.vertices) continue;
+    // In the image for the light everything stands for something far away that
+    // casts long shafts into the haze, like the skyline. A ship at the horizon may
+    // do that, a bird or an aircraft crossing the sky may not.
+    if (into == Into::LIGHT && !model.afloat) continue;
+    // Its rotation: first the bank around its length, then the nose up, then the
+    // heading.
+    double cb = std::cos(p.bank), sb = std::sin(p.bank), cp = std::cos(p.pitch), sp = std::sin(p.pitch);
+    double ch = std::cos(p.heading), sh = std::sin(p.heading);
+    double rot[3][3];
+    for (int j = 0; j < 3; j++) {
+      double x = (j == 0) * cb + (j == 1) * sb, y = -(j == 0) * sb + (j == 1) * cb, z = j == 2;
+      double up = y * cp + z * sp, ahead = -y * sp + z * cp;
+      rot[0][j] = x * ch + ahead * sh;
+      rot[1][j] = up;
+      rot[2][j] = -x * sh + ahead * ch;
+    }
+    // Its rectangle in the image, from the corners of its extent. Beating wings
+    // reach above and below it.
+    double lo[3] = {m.lo[0], m.lo[1] - m.wing[1], m.lo[2]}, hi[3] = {m.hi[0], m.hi[1] + m.wing[1], m.hi[2]};
+    if (p.mirrored) lo[0] = -m.hi[0], hi[0] = -m.lo[0];
+    double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, zNear = 1e12, zFar = 0;
+    for (int k = 0; k < 8; k++) {
+      double c[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]}, at[3];
+      for (int i = 0; i < 3; i++) at[i] = rot[i][0] * c[0] + rot[i][1] * c[1] + rot[i][2] * c[2] + p.pos[i];
+      zNear = std::min(zNear, at[2]);
+      zFar = std::max(zFar, at[2]);
+      if (at[2] < 2) continue;
+      at[1] += lift - curve * (at[0] * at[0] + at[2] * at[2]) / (2 * R_EFF);
+      double sx = 0.5 * viewW_ + at[0] / at[2] * f, sy = hz - at[1] / at[2] * f;
+      x0 = std::min(x0, sx), x1 = std::max(x1, sx);
+      y0 = std::min(y0, sy), y1 = std::max(y1, sy);
+    }
+    if (zNear < 2) continue;
+    D3D11_RECT box = {LONG(std::max(0.0, std::floor((x0 - 1.5) * density))), LONG(std::max(0.0, std::floor((y0 - 1.5) * density))),
+                      LONG(std::min(double(w), std::ceil((x1 + 1.5) * density))), LONG(std::min(double(h), std::ceil((y1 + 1.5) * density)))};
+    int bw = box.right - box.left, bh = box.bottom - box.top;
+    if (bw <= 0 || bh <= 0) continue;
+    // Pixels of the work image per pixel of the target and axis: a whole number as
+    // long as it is small enough. Nothing is meant to come so close that the work
+    // image would not hold it; if it does, it is computed more coarsely.
+    double fine = std::min(double(PROP_W) / bw, double(PROP_H) / bh);
+    fine = fine >= 1 ? std::min(std::floor(fine), double(PROP_FINE)) : fine;
+
+    PropC c = {};
+    for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 3; j++) c.row[i][j] = float(rot[i][j]);
+      c.row[i][3] = float(p.pos[i]);
+    }
+    c.rect[0] = float(box.left / density), c.rect[1] = float(box.top / density);
+    c.rect[2] = float(box.right / density), c.rect[3] = float(box.bottom / density);
+    double pad = 0.1 * (zFar - zNear) + m.wing[1] + 0.5;
+    c.depth[0] = float(std::max(zNear - pad, 1.0)), c.depth[1] = float(zFar + pad);
+    c.depth[2] = float(lift), c.depth[3] = float(curve);
+    c.work[0] = float(box.left), c.work[1] = float(box.top), c.work[2] = float(fine), c.work[3] = float(propSamples_);
+    double flat = p.pos[0] * p.pos[0] + p.pos[2] * p.pos[2];
+    c.air[0] = float(std::sqrt(flat + (p.pos[1] - eye) * (p.pos[1] - eye)));
+    c.air[1] = float(g.eyeSea - g.eyeWater + p.pos[1]);
+    c.air[2] = model.afloat ? 1.0f : 0.0f;
+    c.air[3] = model.gloss;
+    // The shadow of the clouds: for what floats, as on the water at its water line
+    // where the eye sees it; above the clouds none; otherwise as at the viewer.
+    c.light[0] = float((0.5 * viewW_ + p.pos[0] / p.pos[2] * f) / viewW_);
+    c.light[1] = float((hz + (eye + flat / (2 * R_EFF)) / p.pos[2] * f) / viewH_);
+    c.light[2] = model.afloat && g.water ? 1.0f : p.pos[1] - eye > 2200 + g.cloudLift ? 2.0f : 0.0f;
+    c.light[3] = g.water ? 0.12f : 0.22f;
+    c.wing[0] = p.wing, c.wing[1] = p.tip, c.wing[2] = m.wing[0], c.wing[3] = m.wing[1];
+    c.axis[0] = m.wing[2], c.axis[1] = p.mirrored ? 1.0f : 0.0f;
+    ctx_->UpdateSubresource(propBuf_.Get(), 0, nullptr, &c, 0, 0);
+
+    // The model alone.
+    const float clear[4] = {};
+    const D3D11_VIEWPORT part = {0, 0, float(bw * fine), float(bh * fine), 0, 1};
+    const UINT stride = MESH_VERTEX, offset = 0;
+    ctx_->PSSetShaderResources(26, 1, none);
+    ctx_->OMSetRenderTargets(1, propRtv_.GetAddressOf(), propDsv_.Get());
+    ctx_->ClearRenderTargetView(propRtv_.Get(), clear);
+    ctx_->ClearDepthStencilView(propDsv_.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+    ctx_->RSSetViewports(1, &part);
+    ctx_->RSSetState(raster_.Get());
+    ctx_->OMSetBlendState(blendOff_.Get(), nullptr, 0xffffffff);
+    ctx_->IASetInputLayout(propLayout_.Get());
+    ctx_->IASetVertexBuffers(0, 1, m.vertices.GetAddressOf(), &stride, &offset);
+    ctx_->IASetIndexBuffer(m.indices.Get(), DXGI_FORMAT_R32_UINT, 0);
+    ctx_->VSSetShader(vsProp_.Get(), nullptr, 0);
+    ctx_->PSSetShader(psPropIn_.Get(), nullptr, 0);
+    ctx_->PSSetShaderResources(25, 1, m.colors.GetAddressOf());
+    ctx_->DrawIndexed(m.count, 0, 0);
+
+    // Laid over the target.
+    ctx_->OMSetRenderTargets(1, &rtv, nullptr);
+    ctx_->RSSetViewports(1, &whole);
+    ctx_->RSSetState(rasterCut_.Get());
+    ctx_->RSSetScissorRects(1, &box);
+    ctx_->OMSetBlendState(into == Into::EYE ? blendOverKeep_.Get() : blendOver_.Get(), nullptr, 0xffffffff);
+    ctx_->IASetInputLayout(nullptr);
+    ctx_->PSSetShaderResources(26, 1, propSrv_.GetAddressOf());
+    quad(psProp_.Get());
+    ctx_->PSSetShaderResources(26, 1, none);
+
+    // Its lamps, once it is dark enough for them: each a point of light whose
+    // brightness falls with the square of the distance. One that would be brighter
+    // than the image can show gets a larger disc instead.
+    if (light_.lights <= 0.01f || into == Into::LIGHT) continue;
+    ctx_->OMSetBlendState(into == Into::EYE ? blendOverKeep_.Get() : blendAdd_.Get(), nullptr, 0xffffffff);
+    for (const Lamp& lamp : m.lamps) {
+      double at[3], away[3], from[3];
+      for (int i = 0; i < 3; i++) at[i] = rot[i][0] * (p.mirrored ? -lamp.pos[0] : lamp.pos[0]) + rot[i][1] * lamp.pos[1] + rot[i][2] * lamp.pos[2] + p.pos[i];
+      if (at[2] < 2) continue;
+      // Does it shine toward the eye? The direction to the eye in the frame of the
+      // model against the axis of its sector.
+      away[0] = -at[0], away[1] = eye - at[1], away[2] = -at[2];
+      double range = std::sqrt(away[0] * away[0] + away[1] * away[1] + away[2] * away[2]);
+      for (int j = 0; j < 3; j++) from[j] = (rot[0][j] * away[0] + rot[1][j] * away[1] + rot[2][j] * away[2]) / range;
+      if (p.mirrored) from[0] = -from[0];
+      double seen = lamp.cosHalf < -1 ? 1 : smooth(lamp.cosHalf - 0.04, lamp.cosHalf + 0.04, from[0] * lamp.axis[0] + from[1] * lamp.axis[1] + from[2] * lamp.axis[2]);
+      if (lamp.period > 0 && std::fmod(time_ / lamp.period + lamp.phase, 1.0) > lamp.lit) seen = 0;
+      if (seen <= 0) continue;
+      double level = at[1] + lift - curve * (at[0] * at[0] + at[2] * at[2]) / (2 * R_EFF);
+      double sx = (0.5 * viewW_ + at[0] / at[2] * f) * density, sy = (hz - level / at[2] * f) * density;
+      double peak = LAMP_GAIN * seen * light_.lights / (range * range * 1e-6), radius = std::max(1.2 * density, 0.9);
+      if (peak > LAMP_PEAK) {
+        radius *= std::min(std::sqrt(peak / LAMP_PEAK), 3.0);
+        peak = LAMP_PEAK;
+      }
+      D3D11_RECT spot = {LONG(std::max(0.0, std::floor(sx - 3 * radius))), LONG(std::max(0.0, std::floor(sy - 3 * radius))),
+                         LONG(std::min(double(w), std::ceil(sx + 3 * radius))), LONG(std::min(double(h), std::ceil(sy + 3 * radius)))};
+      if (spot.right <= spot.left || spot.bottom <= spot.top) continue;
+      c.rect[0] = float(sx), c.rect[1] = float(sy), c.rect[2] = float(radius);
+      for (int i = 0; i < 3; i++) c.wing[i] = float(lamp.color[i] * peak);
+      c.air[0] = float(range);
+      c.air[1] = float(g.eyeSea - g.eyeWater + at[1]);
+      ctx_->UpdateSubresource(propBuf_.Get(), 0, nullptr, &c, 0, 0);
+      ctx_->RSSetScissorRects(1, &spot);
+      quad(psLamp_.Get());
+    }
+  }
+  ctx_->RSSetState(raster_.Get());
+  ctx_->OMSetBlendState(blendOff_.Get(), nullptr, 0xffffffff);
+}
+
 // Sky and land without water: the image that is reflected in the water.
 void Renderer::faceUpper() {
   ID3D11ShaderResourceView* none[1] = {};
@@ -1969,6 +2348,7 @@ void Renderer::faceUpper() {
   bindClouds();
   bindGround(false);
   quad(psFace_.Get());
+  drawProps(Into::MIRROR, upper_.rtv.Get(), upper_.w, upper_.h);
   target(nullptr, 1, 1);
   ctx_->GenerateMips(upper_.srv.Get());
 }
@@ -1991,6 +2371,9 @@ void Renderer::faceForLight() {
   bindClouds();
   bindGround(water);
   quad(psFace_.Get());
+  drawProps(Into::LIGHT, sky_.rtv.Get(), sky_.w, sky_.h);
+  lightProps_ = props_;
+  lightTime_ = time_;
   target(nullptr, 1, 1);
   ctx_->GenerateMips(sky_.srv.Get());
 }
@@ -1998,8 +2381,10 @@ void Renderer::faceForLight() {
 // The finished sky image for the eye, at full sharpness. It is made in an image
 // of its own that persists, and is copied from there to the target: this way,
 // between two full frames, only the strip with the water can be made anew
-// (waterOnly), the sky above it stays as it was.
-void Renderer::faceForEye(ID3D11RenderTargetView* skyOut, bool waterOnly) {
+// (Redo::WATER) or nothing at all (Redo::NONE), the sky above it stays as it
+// was. What moves through the image is set into the copy every time, where it is
+// at that moment.
+void Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo) {
   if (!skyOut) return;
   loadGround();
   ComPtr<ID3D11Resource> out;
@@ -2011,25 +2396,34 @@ void Renderer::faceForEye(ID3D11RenderTargetView* skyOut, bool waterOnly) {
   if (!eye_.tex || eye_.w != int(d.Width) || eye_.h != int(d.Height) || eyeFormat_ != d.Format) {
     eye_ = makeTarget(int(d.Width), int(d.Height), d.Format, false);
     eyeFormat_ = d.Format;
-    waterOnly = false;
+    redo = Redo::ALL;
   }
   const Ground& g = GROUNDS[groundOf(par_)];
   SkyC c;
-  target(eye_.rtv.Get(), pixW_, pixH_);
-  if (waterOnly) {
-    // From the sea horizon downwards; one row more, its edge is soft.
-    double dip = std::sqrt(2.0 * g.eyeWater / 7433e3);
-    LONG top = LONG(std::clamp(std::floor((horizon() + focal() * dip - 1.5) * scale_) - 1.0, 0.0, double(pixH_ - 1)));
-    D3D11_RECT cut = {0, top, pixW_, pixH_};
-    ctx_->RSSetState(rasterCut_.Get());
-    ctx_->RSSetScissorRects(1, &cut);
+  if (redo != Redo::NONE) {
+    target(eye_.rtv.Get(), pixW_, pixH_);
+    if (redo == Redo::WATER) {
+      // From the sea horizon downwards; one row more, its edge is soft.
+      double dip = std::sqrt(2.0 * g.eyeWater / R_EFF);
+      LONG top = LONG(std::clamp(std::floor((horizon() + focal() * dip - 1.5) * scale_) - 1.0, 0.0, double(pixH_ - 1)));
+      D3D11_RECT cut = {0, top, pixW_, pixH_};
+      ctx_->RSSetState(rasterCut_.Get());
+      ctx_->RSSetScissorRects(1, &cut);
+    }
+    fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
+    bindClouds();
+    bindGround(g.water);
+    quad(psFace_.Get());
+    target(nullptr, 1, 1);
   }
+  ctx_->CopyResource(out.Get(), eye_.tex.Get());
+  if (props_.empty()) return;
+  target(skyOut, pixW_, pixH_);
   fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
   bindClouds();
   bindGround(g.water);
-  quad(psFace_.Get());
+  drawProps(Into::EYE, skyOut, pixW_, pixH_);
   target(nullptr, 1, 1);
-  ctx_->CopyResource(out.Get(), eye_.tex.Get());
 }
 
 // The next band of the running pass. Returns whether the pass is finished with
@@ -2288,10 +2682,12 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   // water is made anew between two full frames. Clouds, light and weather catch up
   // on the elapsed time in the next full frame.
   owed_ += dt;
+  // Ships, aircraft and birds move on with every frame.
+  bool alive = updateLife(dt);
   bool quiet = calm_ && !skyDirty_ && !sceneDirty_ && !iconDirty_ && !cursorMoved_ && !heavenMoved_ && !faceDue_ && !boltDue_ &&
                flash_.level <= 0.001f && eye_.tex;
   if (quiet && skyOut && time_ - worldTime_ < WORLD_EVERY) {
-    faceForEye(skyOut, true);
+    faceForEye(skyOut, GROUNDS[groundOf(par_)].water ? Redo::WATER : Redo::NONE);
     out.sky = out.lively = true;
     return out;
   }
@@ -2377,7 +2773,11 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   bool tick = moving && ++faceTick_ % 2 == 0;
   bool due = faceDue_ && skyAccum_ > 0;
   if (due) faceDue_ = false;
-  if (passDone || drifted || tick || due || flick) {
+  // What moves through the image is also in the image for the light and in the
+  // one the water mirrors: both follow once it has moved visibly, at most thirty
+  // times per second.
+  bool shifted = alive && GROUNDS[groundOf(par_)].water && skyAccum_ > 0 && time_ - lightTime_ >= 1.0 / 31 && propsShifted();
+  if (passDone || drifted || tick || due || flick || shifted) {
     faceForLight();
     if (urgent) sceneDirty_ = true;
     else if (passDone || drifted || flick || faceTick_ % 4 == 0) skyMoved = true;
@@ -2392,9 +2792,14 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
     faceTime_ = time_;
     faceForEye(skyOut);
     out.sky = skyOut != nullptr;
+  } else if (alive && skyAccum_ > 0) {
+    // Nothing but a ship, an aircraft or a bird has moved: the sky stays as it is.
+    faceForEye(skyOut, Redo::NONE);
+    out.sky = skyOut != nullptr;
   }
-  // The image is calm when nothing except the water needs every refresh.
-  calm_ = GROUNDS[groundOf(par_)].water && skyAccum_ >= SKY_ACC && !urgent && !settling && !flick && rainHere_ <= 0.003f;
+  // The image is calm when nothing except the water and what moves through the
+  // image needs every refresh.
+  calm_ = (GROUNDS[groundOf(par_)].water || !props_.empty()) && skyAccum_ >= SKY_ACC && !urgent && !settling && !flick && rainHere_ <= 0.003f;
 
   if (iconDirty_) {
     uploadIcons();

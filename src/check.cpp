@@ -253,7 +253,8 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
               {"RimLight", &Params::rim},     {"OverWindows", &Params::overWindows},
               {"OverSky", &Params::overSky}, {"Shadows", &Params::shade},        {"Wind", &Params::wind},
               {"Stars", &Params::stars},        {"Moonlight", &Params::moonlight},   {"HdrGlow", &Params::glow},
-              {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground}};
+              {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground},
+              {"Life", &Params::life}};
   char key[64];
   float v;
   while (fscanf_s(in, "%63s %f", key, unsigned(sizeof(key)), &v) == 2) {
@@ -270,6 +271,68 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
 }
 
 }  // namespace
+
+int runLifeCheck(const std::wstring& dir) {
+  CreateDirectoryW(dir.c_str(), nullptr);
+  FILE* log = nullptr;
+  if (_wfopen_s(&log, (dir + L"\\life.txt").c_str(), L"w") || !log) return 2;
+  static const char* names[MODEL_COUNT] = {"container", "freighter", "dinghy", "airliner", "gull"};
+  static const char* grounds[3] = {"Mountains", "Skyline", "Sea"};
+  // The wind at the ground at half slider, as the renderer passes it on.
+  const double wind[3] = {6.0, 2.4, 6.0}, eye[3] = {0, 9, 26};
+  const double hours = 48, dt = 0.05;
+  for (int ground = 0; ground < 3; ground++) {
+    Surroundings s;
+    s.ground = ground;
+    s.water = ground > 0;
+    s.eye = eye[ground];
+    s.wind = wind[ground];
+    s.windX = -0.747, s.windZ = -0.665;
+    s.halfWidth = 0.5 * 2560 / 2816;
+    s.top = 1180.8 / 2816;
+    const float length[MODEL_COUNT] = {300, 127, 7.1f, 30.5f, 1.34f};
+    for (int i = 0; i < MODEL_COUNT; i++) s.has[i] = true, s.length[i] = length[i];
+    struct Tally {
+      int times = 0;
+      double seconds = 0, nearest = 1e12, farthest = 0, lowest = 1e9, highest = -1e9, widest = 0;
+      bool there = false;
+    } tally[MODEL_COUNT];
+    Life life;
+    double shown = 0;
+    for (double t = 0; t < hours * 3600; t += dt) {
+      const std::vector<Prop>& now = life.update(dt, s);
+      bool there[MODEL_COUNT] = {};
+      for (const Prop& p : now) {
+        Tally& a = tally[p.model];
+        there[p.model] = true;
+        // Only what is within the image counts as seen.
+        double side = std::abs(p.pos[0] / p.pos[2]) / s.halfWidth, rise = (p.pos[1] - s.eye) / p.pos[2];
+        if (side > 1) continue;
+        a.nearest = std::min(a.nearest, p.pos[2]), a.farthest = std::max(a.farthest, p.pos[2]);
+        a.lowest = std::min(a.lowest, rise), a.highest = std::max(a.highest, rise);
+        a.widest = std::max(a.widest, length[p.model] / p.pos[2] * 2816);
+      }
+      for (int i = 0; i < MODEL_COUNT; i++) {
+        if (there[i] && !tally[i].there) tally[i].times++;
+        if (there[i]) tally[i].seconds += dt;
+        tally[i].there = there[i];
+      }
+      if (!now.empty()) shown += dt;
+    }
+    fprintf(log, "%s, %g hours of daylight, slider at half: something in the image %.1f %% of the time\n", grounds[ground], hours, 100 * shown / (hours * 3600));
+    for (int i = 0; i < MODEL_COUNT; i++) {
+      const Tally& a = tally[i];
+      if (!a.times) {
+        fprintf(log, "  %-10s never\n", names[i]);
+        continue;
+      }
+      fprintf(log, "  %-10s %3d times, %6.1f s each, %4.1f %% of the time, %5.0f to %5.0f m away, largest %4.0f px, height in the image %+.3f to %+.3f\n",
+              names[i], a.times, a.seconds / a.times, 100 * a.seconds / (hours * 3600), a.nearest, a.farthest, a.widest, a.lowest, a.highest);
+    }
+  }
+  fclose(log);
+  return 0;
+}
 
 bool writeImage(const std::wstring& path, const uint8_t* bgra, int w, int h, int factor, int cx, int cy, int cw, int ch) {
   Image im;
@@ -304,6 +367,8 @@ int runCheck(const std::wstring& dir, int viewW, int viewH, float scale) {
     fclose(log);
     return 4;
   }
+  // Nothing appears by chance in images that are compared.
+  r.stage({});
   int pw = int(std::lround(viewW * scale)), ph = int(std::lround(viewH * scale));
   r.resize(pw, ph, scale);
 
@@ -551,6 +616,7 @@ int runReal(const std::wstring& dir, float sunX, float sunY) {
     fclose(log);
     return 3;
   }
+  r.stage({});
   Monitor m = primaryMonitor();
   int pw = m.width(), ph = m.height();
   float scale = m.scale, vw = pw / scale, vh = ph / scale;
@@ -684,6 +750,7 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
     fclose(log);
     return 3;
   }
+  r.stage({});
   int pw = int(std::lround(viewW * scale)), ph = int(std::lround(viewH * scale));
   r.resize(pw, ph, scale);
   Params p;
@@ -701,6 +768,39 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
 
   // flash.txt: every image contains a lightning flash at full brightness.
   bool lightning = GetFileAttributesW((dir + L"\\flash.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+
+  // props.txt: what is in the image instead of what would appear by chance. Per
+  // line a model (container, freighter, dinghy, airliner, gull), its position in
+  // meters (right, above the water, ahead) and its heading in degrees (0 away
+  // from the viewer, 90 to the right); then optionally its speed in meters per
+  // second, nose up and right side down in degrees, the strength of the wing beat
+  // (0 to 1) and 1 for mirrored.
+  if (!_wfopen_s(&in, (dir + L"\\props.txt").c_str(), L"r") && in) {
+    static const char* names[MODEL_COUNT] = {"container", "freighter", "dinghy", "airliner", "gull"};
+    std::vector<Life::Staged> staged;
+    char line[256];
+    fprintf(log, "In the image:\n");
+    while (fgets(line, sizeof(line), in)) {
+      char name[32] = "";
+      float x = 0, y = 0, z = 0, heading = 0, speed = 0, pitch = 0, bank = 0, flap = 0, mirrored = 0;
+      if (sscanf_s(line, "%31s %f %f %f %f %f %f %f %f %f", name, unsigned(sizeof(name)), &x, &y, &z, &heading, &speed, &pitch, &bank, &flap, &mirrored) < 5) continue;
+      for (int i = 0; i < MODEL_COUNT; i++) {
+        if (strcmp(name, names[i])) continue;
+        const float rad = 3.14159265f / 180;
+        Life::Staged s;
+        s.prop.model = i;
+        s.prop.pos[0] = x, s.prop.pos[1] = y, s.prop.pos[2] = z;
+        s.prop.heading = heading * rad, s.prop.pitch = pitch * rad, s.prop.bank = bank * rad;
+        s.prop.mirrored = mirrored > 0.5f;
+        s.velocity[0] = std::sin(heading * rad) * speed, s.velocity[2] = std::cos(heading * rad) * speed;
+        s.flap = flap;
+        staged.push_back(s);
+        fprintf(log, "  %s at %g %g %g, heading %g\n", name, x, y, z, heading);
+      }
+    }
+    fclose(in);
+    r.stage(staged);
+  }
 
   // near.txt: center of a close-up at full sharpness, as a fraction of the image.
   float nearX = -1, nearY = -1;
@@ -1140,6 +1240,7 @@ int runPanelCheck(const std::wstring& dir) {
       !r.init(dev.Get(), ctx.Get())) {
     return 3;
   }
+  r.stage({});
   r.resize(3840, 2160, 1.5f);
   Params par;
   int course = 1;

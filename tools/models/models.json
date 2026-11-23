@@ -1,0 +1,28 @@
+{
+  "container": {
+    "source": "container_ship", "forward": "+X", "up": "+Z", "length": 300.0, "draft": 10.2, "triangles": 60000, "layer": 512,
+    "lights": [["masthead", 0.2, 44.0, -17.4], ["masthead", 0.0, 22.0, 141.0], ["port", -20.6, 34.0, -16.0], ["starboard", 20.6, 34.0, -16.0],
+               ["stern", 0.0, 14.5, -149.5], ["cabin", -15.0, 31.0, -14.5], ["cabin", 15.0, 31.0, -14.5], ["cabin", -8.0, 27.0, -30.5],
+               ["cabin", 8.0, 27.0, -30.5], ["cabin", 0.0, 35.5, -13.5]]
+  },
+  "freighter": {
+    "source": "cargo_ship", "forward": "+X", "up": "+Z", "draft": 4.6, "triangles": 45000, "layer": 512,
+    "lights": [["masthead", 0.9, 32.5, -36.8], ["masthead", 0.4, 20.5, 42.1], ["port", -9.7, 23.0, -31.0], ["starboard", 9.7, 23.0, -31.0],
+               ["stern", 0.0, 12.0, -63.5], ["cabin", -7.0, 15.0, -27.3], ["cabin", 7.0, 15.0, -27.3], ["cabin", -9.7, 16.5, -42.0],
+               ["cabin", 9.7, 16.5, -42.0], ["cabin", 0.0, 21.0, -27.3]]
+  },
+  "dinghy": {
+    "source": "yacht", "forward": "-X", "up": "+Z", "draft": 0.19, "triangles": 45000, "layer": 128, "thin": ["canvas"],
+    "lights": [["allround", 0.0, 8.1, 0.2]]
+  },
+  "airliner": {
+    "source": "boeing_737-200__european_aviation_g-ceah", "forward": "-Y", "up": "+Z", "skip": ["Object_15"], "triangles": 60000, "layer": 128,
+    "lights": [["left", -14.2, -2.3, -4.5], ["right", 14.2, -2.3, -4.5], ["tail", 0.0, -1.2, -15.0], ["beacon", 0.0, -0.3, 1.5],
+               ["beacon", 0.0, -4.4, 0.0, 0.5], ["flash", -14.2, -2.3, -4.7], ["flash", 14.2, -2.3, -4.7], ["landing", -2.6, -3.4, 3.0],
+               ["landing", 2.6, -3.4, 3.0]]
+  },
+  "gull": {
+    "source": "seagull_v1", "forward": "-Y", "up": "+Z", "scale": 0.045, "center": "body1_body", "skip": ["feet"],
+    "wing": [0.072, 0.594, 0.085], "layer": 256, "thin": ["feeathers", "wing"]
+  }
+}

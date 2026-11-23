@@ -35,6 +35,11 @@ windows.
 - **Water** reflects sky and land, shows the glitter path of sun and moon, cloud
   shadows, swell, whitecaps in fresh wind and the lights of the city as long
   columns.
+- **Life**, rarely: a ship at the sea horizon, a sailing dinghy when the wind
+  suits, an airliner, a few gulls. They lie in the haze, behind clouds and rain
+  according to their distance, are mirrored in the water and carry lights at
+  night. Most of the time the image is empty; a slider sets how often something
+  passes.
 - **Light**: a click-through layer above all windows adds scattered light and
   shadows, rim light on window edges and dust. HDR displays are supported.
 - **Live weather** (optional) sets clouds, rain, thunderstorms and wind from
@@ -105,11 +110,12 @@ measurements:
 
 | Command | Effect |
 |---|---|
-| `Sunbeam.exe --sky <folder>` | Renders the sky of an empty desktop to images. Optional files in the folder: `cases.txt` (times or sun positions), `values.txt` (settings), `windows.txt`, `near.txt`, `run.txt`, `flash.txt`, `sequence.txt`, `glide.txt`, `place.txt`. |
+| `Sunbeam.exe --sky <folder>` | Renders the sky of an empty desktop to images. Optional files in the folder: `cases.txt` (times or sun positions), `values.txt` (settings), `windows.txt`, `near.txt`, `run.txt`, `flash.txt`, `sequence.txt`, `glide.txt`, `place.txt`, `props.txt` (ships, aircraft and birds to place in the image). |
 | `Sunbeam.exe --check <folder>` | Renders a test scene and measures frame times. |
 | `Sunbeam.exe --real <folder> [x y]` | Renders the image for the windows and icons currently on the desktop. Icons are drawn as blocks. |
 | `Sunbeam.exe --drift <folder>` | Compares drifting clouds with a reference rendering. |
 | `Sunbeam.exe --panel <folder>` | Draws the pages of the settings window to files. |
+| `Sunbeam.exe --life <folder>` | Lets two days pass per ground and writes down how often ships, aircraft and birds appeared and for how long. |
 | `Sunbeam.exe --weather <folder> [place]` | Looks a place up, fetches its weather once and writes down the resulting slider positions. |
 | `Sunbeam.exe --scene <file>` | Lists window classes and positions on the desktop (no titles). |
 | `Sunbeam.exe --probe <folder> [seconds]` | Runs the real loop on the desktop for a few seconds without a tray icon and logs. |
@@ -127,11 +133,13 @@ The formats of the input files are described at the functions in
 | `src\panel.cpp` | Settings window (Direct2D) |
 | `src\astro.cpp`, `src\daycycle.cpp` | Positions of sun and moon and their place in the image |
 | `src\weather.cpp`, `src\place.cpp`, `src\net.cpp` | Live weather, place search, HTTPS |
+| `src\life.cpp` | When a ship, an aircraft or birds appear, and how they move |
 | `src\check.cpp` | Check modes |
 | `shader\sky.hlsl`, `shader\clouds.hlsli`, `shader\ground.hlsli` | Sky, clouds, rain, lightning, land and water |
 | `shader\light.hlsl` | Scattered light, shadows, glare, dust |
-| `ground\`, `clouds\`, `images\` | Data built into the program |
+| `ground\`, `clouds\`, `images\`, `models\` | Data built into the program |
 | `tools\ground\` | Scripts that produced the ground strips |
+| `tools\models\` | Script that converted the models |
 
 ## Limits
 
@@ -141,11 +149,14 @@ The formats of the input files are described at the functions in
 - Water is a flat surface with tilted reflections; tall waves do not hide what
   is behind them.
 - The skyline is missing one tower that was built after the lidar scan of 2017.
+- Ships leave no wake, the dinghy sails without a crew, and nothing casts a
+  shadow onto itself.
 
 ## Credits and licence
 
 Sunbeam is released under the [MIT licence](LICENSE). It uses methods, code and
 data from others, among them three-geospatial (clouds), the ocean lighting
 method of Bruneton, Neyret and Holzschuch, swisstopo, the U.S. Geological
-Survey, OpenStreetMap, NASA and Open-Meteo. The full list with licences is in
-[CREDITS.md](CREDITS.md).
+Survey, OpenStreetMap, NASA and Open-Meteo, and models by RM02, hungry_drifter,
+MesXwi, Julian Johnson-Mortimer and mgg8, which keep their own licences (CC BY
+4.0 and CC0). The full list with licences is in [CREDITS.md](CREDITS.md).

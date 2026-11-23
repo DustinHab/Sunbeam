@@ -1,0 +1,38 @@
+Models
+
+What moves through the image: two ships, a sailing dinghy, an airliner and a
+gull. Each is a model made by someone else, converted with
+tools\models\convert.py into a mesh (.mesh) and its surface colours (.png). The
+conversion reduces the number of triangles and the size of the textures, keeps
+only the base colours, scales the model to metres, puts ships on their water
+line and adds the positions of their lamps. Other changes are noted per model.
+
+container.mesh, container.png
+  "Container Ship" by RM02 (https://sketchfab.com/RM02)
+  https://sketchfab.com/3d-models/container-ship-aaa41cca946b4a08bc08cf692b7757be
+  Licence: CC BY 4.0, http://creativecommons.org/licenses/by/4.0/
+  Scaled to a length of 300 m.
+
+freighter.mesh, freighter.png
+  "Cargo ship" by hungry_drifter (https://sketchfab.com/hungry_drifter)
+  https://sketchfab.com/3d-models/cargo-ship-b7c97df584824ca682d26daabf401f87
+  Licence: CC BY 4.0, http://creativecommons.org/licenses/by/4.0/
+
+dinghy.mesh, dinghy.png
+  "Yacht" by MesXwi (https://sketchfab.com/MesXwi)
+  https://sketchfab.com/3d-models/yacht-ae42c1609c25412cbfe40baf9728d987
+  Licence: CC BY 4.0, http://creativecommons.org/licenses/by/4.0/
+  The program also shows it mirrored, with the sails on the other side.
+
+airliner.mesh, airliner.png
+  "Boeing 737-200 - European Aviation G-CEAH" by mgg8 (https://sketchfab.com/mgg8)
+  https://sketchfab.com/3d-models/boeing-737-200-european-aviation-g-ceah-e3224d0aa8c54f41a612ac74e35e045e
+  Licence: CC0 1.0, http://creativecommons.org/publicdomain/zero/1.0/
+  The lettering of the airline and the registration are left out.
+
+gull.mesh, gull.png
+  "seagull v1" by Julian Johnson-Mortimer (https://sketchfab.com/FreddyFoxFreddy)
+  https://sketchfab.com/3d-models/seagull-v1-f3fa166ff6bd4ffe8133f6f6eed74d64
+  Licence: CC BY 4.0, http://creativecommons.org/licenses/by/4.0/
+  The feet are left out (a gull in flight tucks them away), and the program
+  moves the wings.

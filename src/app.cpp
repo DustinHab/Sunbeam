@@ -64,6 +64,7 @@ const Setting SETTINGS[] = {
     {L"Pointer", &Params::pointer},     {L"Stars", &Params::stars},
     {L"Moonlight", &Params::moonlight},   {L"HdrGlow", &Params::glow},
     {L"MoonSize", &Params::moonRadius}, {L"Rays", &Params::rays}, {L"Ground", &Params::ground},
+    {L"Life", &Params::life},
 };
 
 struct App {
@@ -263,6 +264,7 @@ void loadSettings() {
   p.stars = std::clamp(p.stars, 0.0f, 2.0f);
   p.moonlight = std::clamp(p.moonlight, 0.0f, 3.0f);
   p.glow = std::clamp(p.glow, 1.0f, 6.0f);
+  p.life = std::clamp(p.life, 0.0f, 1.0f);
   app->par = p;
   // With live weather, what is in the file counts as set by hand; the sliders stay
   // where the weather has put them.

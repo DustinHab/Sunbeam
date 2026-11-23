@@ -158,6 +158,7 @@ void build(Panel& p) {
   sky.push_back(wind);
   sky.push_back(with(slider(L"Stars", &h.par->stars, 0, 2), fresh.stars));
   sky.push_back(with(slider(L"Moonlight", &h.par->moonlight, 0, 3), fresh.moonlight));
+  sky.push_back(with(slider(L"Life", &h.par->life, 0, 1), fresh.life));
   static const wchar_t* grounds[3] = {L"Mountains", L"Skyline", L"Sea"};
   for (int i = 0; i < 3; i++) {
     Row r;

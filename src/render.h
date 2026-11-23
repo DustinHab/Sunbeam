@@ -17,6 +17,20 @@
 #include <cstdint>
 #include <vector>
 
+#include "life.h"
+
+// A lamp on a ship or an aircraft, in the frame of its model (meters: right, up,
+// forward). It shines into a sector around axis; cosHalf is the cosine of the
+// half angle of that sector, below -1 all around. period: seconds per flash, 0
+// steady; lit: fraction of the period it is on; phase: offset as a fraction.
+struct Lamp {
+  float pos[3];
+  float color[3];   // its light, times its strength
+  float axis[3];
+  float cosHalf;
+  float period, lit, phase;
+};
+
 // What is in the way of the light, in logical pixels. kind: 1 window, 2 taskbar.
 struct Occluder {
   float x0, y0, x1, y1;
@@ -61,6 +75,7 @@ struct Params {
   float moonlight = 1.0f;     // Moonlight: strength of the light at night
   float glow = 2.0f;          // HDR glow: brightness of the sun as a multiple of white, 1 = off
   float ground = 0.0f;        // Ground: 0 Mountains, 1 Skyline, 2 Sea
+  float life = 0.5f;          // Life: how often a ship, an aircraft or birds pass, 0 = never
   float resolution = 0.5f;    // resolution of the scattered light
   int steps = 40;             // steps of the scattered light
   bool operator==(const Params&) const = default;
@@ -146,6 +161,11 @@ class Renderer {
   double cloudShift() const { return cloudT_; }
   double cloudAge() const { return evolveT_; }
   void seek(double cloudShift, double age) { cloudT_ = cloudShift; evolveT_ = age; started_ = true; skyDirty_ = true; }
+  // For still images: exactly these ships, aircraft and birds are in the image
+  // (see Life::stage).
+  void stage(const std::vector<Life::Staged>& list) { life_.stage(list); }
+  // How many of them are in the image right now.
+  int propCount() const { return int(props_.size()); }
 
  private:
   struct Target {
@@ -208,6 +228,19 @@ class Renderer {
     float alt = 0.3f;                  // its true altitude in radians
     float lights = 0;                  // how bright the lights of the city are
   };
+  // A model of something that moves through the image.
+  struct Mesh {
+    Microsoft::WRL::ComPtr<ID3D11Buffer> vertices, indices;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> colors;   // its surface colors, one layer per material
+    UINT count = 0;                    // number of indices
+    float lo[3] = {}, hi[3] = {};      // its extent in meters: right, up, forward
+    float wing[3] = {};                // birds: half width of the body, length of a wing, height of the wing root
+    std::vector<Lamp> lamps;           // its lights for the night
+  };
+  // Which image the models are set into.
+  enum class Into { EYE, LIGHT, MIRROR };
+  // What of the image for the eye is made anew.
+  enum class Redo { ALL, WATER, NONE };
 
   Target makeTarget(int w, int h, DXGI_FORMAT format, bool mips);
   void makeNoise();
@@ -244,7 +277,12 @@ class Renderer {
   void drawWaterMaps(bool sums, bool shade);
   void faceUpper();
   void faceForLight();
-  void faceForEye(ID3D11RenderTargetView* skyOut, bool waterOnly = false);
+  void faceForEye(ID3D11RenderTargetView* skyOut, Redo redo = Redo::ALL);
+  bool loadMesh(int model);
+  bool allocProps();
+  bool updateLife(double dt);
+  bool propsShifted() const;
+  void drawProps(Into into, ID3D11RenderTargetView* rtv, int w, int h);
   void drawBase();
   bool stepBand();
   void uploadIcons();
@@ -255,11 +293,13 @@ class Renderer {
 
   Microsoft::WRL::ComPtr<ID3D11Device> dev_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx_;
-  Microsoft::WRL::ComPtr<ID3D11VertexShader> vsFull_, vsDust_, vsBolt_, vsBoltFar_;
+  Microsoft::WRL::ComPtr<ID3D11VertexShader> vsFull_, vsDust_, vsBolt_, vsBoltFar_, vsProp_;
   Microsoft::WRL::ComPtr<ID3D11PixelShader> psNoise_, psAir_, psNear_, psNearBlock_, psBase_, psHaze_, psFace_, psPick_, psRain_, psShade_, psColumn_, psColumnBlock_, psBolt_, psBoltFar_, psScatter_, psBloomPre_,
-      psBloomDown_, psBloomUp_, psComposite_, psFlash_, psDust_;
+      psBloomDown_, psBloomUp_, psComposite_, psFlash_, psDust_, psProp_, psPropIn_, psLamp_;
   Microsoft::WRL::ComPtr<ID3D11SamplerState> clamp_, wrap_;
-  Microsoft::WRL::ComPtr<ID3D11BlendState> blendOff_, blendShare_, blendAdd_, blendMax_;
+  // blendOver_ lays an image over the target by its coverage and reduces what the
+  // target holds in a by that much; blendOverKeep_ leaves a as it is.
+  Microsoft::WRL::ComPtr<ID3D11BlendState> blendOff_, blendShare_, blendAdd_, blendMax_, blendOver_, blendOverKeep_;
   Microsoft::WRL::ComPtr<ID3D11RasterizerState> raster_, rasterCut_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> skyBuf_, lightBuf_, noiseBuf_;
   Microsoft::WRL::ComPtr<ID3D11Query> event_;
@@ -301,6 +341,22 @@ class Renderer {
   int mapTick_ = 0;         // counts how often sums and shadows have been made since the last user change
   int columnTop_ = 0, columnH_ = 1;   // top row of this strip in upper_ and its height
   Target shade_;            // shadows of the clouds on the water, a quarter of the edge length
+
+  // Ships, aircraft, birds.
+  Life life_;
+  std::vector<Prop> props_;        // what is in the image right now
+  std::vector<Prop> lightProps_;   // and what was when the image for the light was last made
+  double lightTime_ = 0;           // when that was
+  Mesh mesh_[MODEL_COUNT];
+  Microsoft::WRL::ComPtr<ID3D11InputLayout> propLayout_;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> propBuf_;
+  // The work image in which one model at a time is computed, with several samples
+  // per pixel, and its depth.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> propColor_, propDepth_;
+  Microsoft::WRL::ComPtr<ID3D11RenderTargetView> propRtv_;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilView> propDsv_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> propSrv_;
+  int propSamples_ = 0;            // samples per pixel there; -1: the graphics card offers none
 
   Target base_;     // sky without clouds, at the resolution of the clouds
   // Clouds, averaged: rgb = their light, a = transmittance. Three images in a

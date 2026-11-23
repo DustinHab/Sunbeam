@@ -34,6 +34,24 @@ from the low-precision series of the Astronomical Almanac.
 Details on the ground strips are in [ground/SOURCES.txt](ground/SOURCES.txt), on
 the moon in [images/SOURCES.txt](images/SOURCES.txt).
 
+## Models
+
+The ships, the dinghy, the airliner and the gull (`models/`) are the work of
+their authors, converted for this program: fewer triangles, smaller textures
+with the base colours only, scaled to metres. Further changes are listed in
+[models/SOURCES.txt](models/SOURCES.txt).
+
+| Model | Based on | Licence |
+|---|---|---|
+| Container ship | ["Container Ship"](https://sketchfab.com/3d-models/container-ship-aaa41cca946b4a08bc08cf692b7757be) by [RM02](https://sketchfab.com/RM02) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
+| Freighter | ["Cargo ship"](https://sketchfab.com/3d-models/cargo-ship-b7c97df584824ca682d26daabf401f87) by [hungry_drifter](https://sketchfab.com/hungry_drifter) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
+| Sailing dinghy | ["Yacht"](https://sketchfab.com/3d-models/yacht-ae42c1609c25412cbfe40baf9728d987) by [MesXwi](https://sketchfab.com/MesXwi) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
+| Gull | ["seagull v1"](https://sketchfab.com/3d-models/seagull-v1-f3fa166ff6bd4ffe8133f6f6eed74d64) by [Julian Johnson-Mortimer](https://sketchfab.com/FreddyFoxFreddy) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
+| Airliner | ["Boeing 737-200 — European Aviation G-CEAH"](https://sketchfab.com/3d-models/boeing-737-200-european-aviation-g-ceah-e3224d0aa8c54f41a612ac74e35e045e) by [mgg8](https://sketchfab.com/mgg8) | [CC0 1.0](http://creativecommons.org/publicdomain/zero/1.0/) |
+
+These models keep their own licences; the MIT licence of the program does not
+replace them.
+
 ## Licence texts
 
 ### MIT (TileableVolumeNoise, Hash without Sine)

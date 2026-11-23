@@ -12,6 +12,8 @@
 //   Sunbeam.exe --drift <folder>       compares drifting clouds with the correct
 //                                      image
 //   Sunbeam.exe --panel <folder>       draws the settings window to files
+//   Sunbeam.exe --life <folder>        lets two days pass and writes down how
+//                                      often ships, aircraft and birds appeared
 //   Sunbeam.exe --blendtest <file>     measures on the display whether the light
 //                                      window enters the image
 //   Sunbeam.exe --probe <folder> [s]   attaches to the desktop briefly and
@@ -55,6 +57,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     return runSky(args[2], w, h, scale);
   }
   if (args.size() >= 3 && args[1] == L"--panel") return runPanelCheck(args[2]);
+  if (args.size() >= 3 && args[1] == L"--life") return runLifeCheck(args[2]);
   if (args.size() >= 3 && args[1] == L"--drift") return runDrift(args[2], 2560, 1440, 1.5f);
   if (args.size() >= 3 && args[1] == L"--weather") {
     // Without a place a fixed one, so that a check reveals nothing about the user.

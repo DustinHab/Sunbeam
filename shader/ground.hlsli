@@ -556,6 +556,15 @@ float rainBefore(float3 rain, float dist) {
   return smoothstep(-1.7, 1.7, (dist - rain.g * 1000.0) / max(deep, 1.0));
 }
 
+// How much of the light source's light the clouds let through to the viewer: if
+// it is behind a cloud, the ground lacks its direct light.
+float sunThrough() {
+  float2 su = airUv(uSun), sd = 1.6 * uSunR / float2(uView.x + 2.0 * GUARD, uView.y);
+  return 0.2 * (tCloud.SampleLevel(sClamp, su, 0.0).a + tCloud.SampleLevel(sClamp, su + float2(sd.x, 0.0), 0.0).a +
+                tCloud.SampleLevel(sClamp, su - float2(sd.x, 0.0), 0.0).a + tCloud.SampleLevel(sClamp, su + float2(0.0, sd.y), 0.0).a +
+                tCloud.SampleLevel(sClamp, su - float2(0.0, sd.y), 0.0).a);
+}
+
 // Places the ground in the image. First the water up to the sea horizon, the
 // land in front of it. sky: the sky without clouds, cloud: their light and their
 // transmittance, cloudZ: their mean distance and its spread in km (0 = none),
@@ -576,11 +585,7 @@ void ground(float2 p, float3 v, float2 uv, float3 sky, float4 cloud, float2 clou
   haze = lerp(haze, luma(haze) * float3(0.86, 0.89, 0.95) * (1.0 - 0.4 * uStorm.x), 0.9 * uLand.y);
   float tFront, tBack;
   float3 lightFront, lightBack;
-  // If the light source is behind a cloud, the ground lacks its direct light.
-  float2 su = airUv(uSun), sd = 1.6 * uSunR / float2(uView.x + 2.0 * GUARD, uView.y);
-  sunOpen = 0.2 * (tCloud.SampleLevel(sClamp, su, 0.0).a + tCloud.SampleLevel(sClamp, su + float2(sd.x, 0.0), 0.0).a +
-                   tCloud.SampleLevel(sClamp, su - float2(sd.x, 0.0), 0.0).a + tCloud.SampleLevel(sClamp, su + float2(0.0, sd.y), 0.0).a +
-                   tCloud.SampleLevel(sClamp, su - float2(0.0, sd.y), 0.0).a);
+  sunOpen = sunThrough();
   if (uGround.y > 0.5 && uPass < 0.5) {
     float cover, far;
     float3 w = water(p, v, haze, cover, far);

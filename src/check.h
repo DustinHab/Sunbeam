@@ -29,6 +29,10 @@ int runPanelCheck(const std::wstring& dir);
 // and where the sliders went with it; plus a series of sample conditions.
 int runWeatherCheck(const std::wstring& dir, const std::wstring& query);
 
+// Lets two days pass for each ground and writes to life.txt how often ships,
+// aircraft and birds appeared, for how long, and where in the image.
+int runLifeCheck(const std::wstring& dir);
+
 // Measures on the real display, with a small, barely visible patch, whether a
 // window like the light window adds to the image below it and can darken it.
 int runBlendCheck(const std::wstring& file);

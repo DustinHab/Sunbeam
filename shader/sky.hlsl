@@ -703,20 +703,19 @@ float rainFall(float2 p) {
 // The final sky image. uShow = 1 draws it including the sun disc for the screen;
 // 0 yields luminance without the disc, and transmittance, for the light layer
 // (there skyAt adds the disc with a sharp edge).
-float4 Face(float4 pos : SV_Position) : SV_Target {
-  float2 uv = pos.xy / uRes;
-  float2 p = uv * uView;
-  // The clouds are where the wind has carried them since their pass. When a new
-  // pass arrives, it fades in over the duration of the next one: this way the
-  // image changes steadily instead of jumping with every pass.
+// The clouds at a position in the image, in view direction toward: their light
+// and transmittance, and their mean distance and its spread in km (0 = none).
+// They are where the wind has carried them since their pass. When a new pass
+// arrives, it fades in over the duration of the next one: this way the image
+// changes steadily instead of jumping with every pass.
+void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   float zThere;
-  float3 toward = dirOf(p);
   float2 au = airUv(p);
   float2 from = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, zThere);
-  float4 cloud = tCloud.SampleLevel(sClamp, from, 0.0);
+  cloud = tCloud.SampleLevel(sClamp, from, 0.0);
   // Distance of the clouds at this position in km, 0 = none: by this they lie in
   // front of or behind the land.
-  float2 cloudZ = depthSoft(tCloudZ, from);
+  cloudZ = depthSoft(tCloudZ, from);
   // Where none is known at this position itself, that of the clouds around it.
   if (cloudZ.x <= 0.0) cloudZ = float2(tNear.SampleLevel(sClamp, from, 0.0).r, 0.0);
   if (uFade < 0.999) {
@@ -727,6 +726,15 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
     cloud = lerp(older, cloud, uFade);
     cloudZ = cloudZ.x > 0.0 && zOlder.x > 0.0 ? lerp(zOlder, cloudZ, uFade) : (cloudZ.x > 0.0 ? cloudZ : zOlder);
   }
+}
+
+float4 Face(float4 pos : SV_Position) : SV_Target {
+  float2 uv = pos.xy / uRes;
+  float2 p = uv * uView;
+  float3 toward = dirOf(p);
+  float4 cloud;
+  float2 cloudZ;
+  cloudsAt(p, toward, cloud, cloudZ);
   // Sheet lightning: lightning lights the clouds around it from inside. What lies
   // close to it glows; clouds in front, farther away from it, stay dark and appear
   // as an outline against the glow.
@@ -809,6 +817,228 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
   // Instead of the transmittance, the mirror image stores how much of the light at
   // each position comes from lamps.
   return float4(col, uPass > 0.5 ? landLights : alpha);
+}
+
+// What moves through the image: ships, an aircraft, birds. Each is a mesh with
+// its surface colors in the layers of one texture. It is computed in two steps.
+// First the mesh alone, lit, into a small work image with several samples per
+// pixel and, if it is small in the image, several of its pixels per pixel of the
+// image: masts and wings are much thinner than a pixel and would flicker
+// otherwise. Then that image is set into the sky: behind haze, clouds and rain
+// according to its distance.
+cbuffer PropC : register(b3) {
+  float4 uPropRow[3];   // rows of the rotation of the model; w: where its origin is, meters: right of the eye, above the water, ahead
+  float4 uPropRect;     // its rectangle in the image, logical pixels: left, top, right, bottom
+  float4 uPropDepth;    // x: nearest, y: farthest distance in meters; z: height of the water above the eye (in the mirror image: below it), w: factor on the curvature of the Earth
+  float4 uPropWork;     // x, y: left top corner of the rectangle in pixels of the target, z: pixels of the work image per pixel and axis (a whole number, or less than 1), w: samples per pixel there
+  float4 uPropAir;      // x: distance of the object in meters, y: its height above sea level, z: 1 = cut off below the water line, w: gloss
+  float4 uPropLight;    // x, y: position in the image at which the shadow of the clouds on the water is read; z: 1 = read it there, 0 = as at the viewer, 2 = above the clouds; w: how much light comes back from below
+  float4 uPropWing;     // birds: x: angle of the inner wing, y: additional angle of the outer wing, z: half width of the body, w: length of a wing (0 = rigid)
+  float4 uPropAxis;     // x: height of the wing root in the model, y: 1 = mirrored left to right
+};
+
+Texture2DArray tPropTex : register(t25);          // surface colors of the model, one layer per material
+Texture2DMS<float4> tPropWork : register(t26);    // the work image: light of the covered samples, a = covered
+
+struct PropVert {
+  float3 pos : POSITION;      // meters: right, up, forward
+  float4 normal : NORMAL;
+  float2 uv : TEXCOORD0;
+  float4 tint : COLOR0;       // color factor of the material, a = its layer
+};
+
+struct PropOut {
+  float4 pos : SV_Position;
+  float3 normal : NORMAL;
+  float3 uvl : TEXCOORD0;
+  float3 tint : COLOR0;
+  float3 at : TEXCOORD1;      // position relative to the eye
+  float height : TEXCOORD2;   // above the water
+  float thin : TEXCOORD3;     // 1: sailcloth or feathers, light shines through
+};
+
+PropOut PropVS(PropVert v) {
+  float3 m = v.pos, n = v.normal.xyz;
+  if (uPropWing.w > 0.0) {
+    // The wing beat: the inner wing turns at the shoulder, the outer part bends
+    // further at the wrist. Each point turns around the shoulder by the angle that
+    // applies at its distance from the body.
+    float side = m.x < 0.0 ? -1.0 : 1.0;
+    float2 q = float2(abs(m.x) - uPropWing.z, m.y - uPropAxis.x);
+    float t = saturate(q.x / uPropWing.w);
+    float sn, cs;
+    sincos(uPropWing.x * smoothstep(0.0, 0.18, t) + uPropWing.y * smoothstep(0.38, 0.72, t), sn, cs);
+    q = float2(q.x * cs - q.y * sn, q.x * sn + q.y * cs);
+    m.x = side * (q.x + uPropWing.z);
+    m.y = q.y + uPropAxis.x;
+    float2 nq = float2(n.x * side, n.y);
+    nq = float2(nq.x * cs - nq.y * sn, nq.x * sn + nq.y * cs);
+    n.x = nq.x * side;
+    n.y = nq.y;
+  }
+  if (uPropAxis.y > 0.5) {
+    m.x = -m.x;
+    n.x = -n.x;
+  }
+  PropOut o;
+  float3 at = float3(dot(uPropRow[0].xyz, m), dot(uPropRow[1].xyz, m), dot(uPropRow[2].xyz, m)) + float3(uPropRow[0].w, uPropRow[1].w, uPropRow[2].w);
+  o.normal = float3(dot(uPropRow[0].xyz, n), dot(uPropRow[1].xyz, n), dot(uPropRow[2].xyz, n));
+  o.height = at.y;
+  // As seen from the eye: the water lies below it, and with distance the Earth
+  // curves away downward.
+  at.y += uPropDepth.z - uPropDepth.w * dot(at.xz, at.xz) / (2.0 * R_EFF);
+  o.at = at;
+  float2 s = pointOf(at);
+  float2 ndc = (s - uPropRect.xy) / (uPropRect.zw - uPropRect.xy) * float2(2.0, -2.0) + float2(-1.0, 1.0);
+  o.pos = float4(ndc * at.z, (at.z - uPropDepth.x) * uPropDepth.y / (uPropDepth.y - uPropDepth.x), at.z);
+  o.uvl = float3(v.uv, round(v.tint.a * 255.0));
+  o.tint = pow(max(v.tint.rgb, 0.0), 2.2);
+  o.thin = v.normal.w > 0.5 ? 1.0 : 0.0;
+  return o;
+}
+
+struct PropLit {
+  float4 col : SV_Target;
+  uint cover : SV_Coverage;
+};
+
+// The lit surface of the model.
+PropLit PropIn(PropOut v) {
+  PropLit o;
+  float4 tex = tPropTex.Sample(sWrap, v.uvl);
+  // Parts of a surface that are see-through (railings, rigging painted into the
+  // texture) cover that fraction of the samples.
+  int samples = int(uPropWork.w);
+  int kept = tex.a > 0.995 ? samples : int(tex.a * float(samples) + ign(v.pos.xy));
+  if (kept <= 0 || (uPropAir.z > 0.5 && v.height < 0.0)) discard;
+  o.cover = kept >= samples ? 0xffffffffu : (1u << uint(kept)) - 1u;
+
+  float3 view = normalize(-v.at);
+  float3 n = normalize(v.normal);
+  // Thin parts such as sails are seen from both sides.
+  if (dot(n, view) < 0.0) n = -n;
+  // What floats is lit like the land beside it. What flies is lit like the clouds
+  // around it: backlit in front of the light source, from the side far from it.
+  float3 l = groundLight();
+  float open = sunThrough();
+  if (uPropLight.z > 0.5 && uPropLight.z < 1.5) {
+    open = lerp(open, tShade.SampleLevel(sClamp, uPropLight.xy, 0.0).r, smoothstep(0.05, 0.16, l.y));
+  } else {
+    l = lightDir(normalize(float3(uPropRow[0].w, uPropRow[1].w + uPropDepth.z, uPropRow[2].w)));
+    if (uPropLight.z > 1.5) open = 1.0;
+  }
+  float facing = saturate(dot(n, l));
+  // Through sailcloth and feathers part of the light shines when it comes from
+  // behind.
+  if (v.thin > 0.5) facing += 0.25 * saturate(-dot(n, l));
+  // The sky lights from above; a vertical surface sees half of it, and on the side
+  // away from the light source the darker half. uSkyLand is the light on open
+  // ground including what the landscape around it returns; a surface in the air
+  // gets less than half of that. From below comes what water or land return.
+  float up = 0.5 + 0.5 * n.y;
+  // In the air the sky is all around, and the direct light is less yellow than at
+  // the ground: white wings stay white.
+  float aloft = uPropLight.z > 0.5 && uPropLight.z < 1.5 ? 0.0 : 1.0;
+  float3 direct = lerp(uSunLand, luma(uSunLand) * float3(1.03, 1.0, 0.95), 0.55 * aloft);
+  float3 light = direct * (facing * open) + uSkyLand * lerp(lerp(0.10, 0.16, aloft), lerp(0.42, 0.48, aloft), up) +
+                 (uSunLand * (saturate(l.y) * open) + uSkyLand * 0.5) * ((1.0 - up) * uPropLight.w);
+  float3 lit = tex.rgb * v.tint * light;
+  // Paint and glass show the light source as a highlight.
+  if (uPropAir.w > 0.0 && facing > 0.0) lit += uSunLand * (open * uPropAir.w * pow(saturate(dot(n, normalize(l + view))), 64.0));
+  o.col = float4(lit, 1.0);
+  return o;
+}
+
+// How much of something at distance dist is left uncovered at a position in the
+// image: land that is nearer covers it, and beyond the sea horizon the water
+// covers what is below it.
+float propOpen(float2 p, float dist) {
+  float open = 1.0;
+  if (uGround.x > 0.5) {
+    float tx = (p.x - 0.5 * uView.x) / uFocal, ty = (uHorizon - p.y) / uFocal;
+    float2 lu = float2(0.5 + tx * 1.1, (uStrip.x - ty) / uStrip.y);
+    if (lu.y > 0.0) {
+      float lod = log2(max(STRIP_W / uRes.x, 1.0));
+      float there = tLandA.SampleLevel(sClamp, lu, lod).a;
+      if (there > 0.002 && DIST_MIN * pow(DIST_MAX / DIST_MIN, tLandB.SampleLevel(sClamp, lu, lod).z) < dist) open *= 1.0 - there;
+    }
+  }
+  if (uGround.y > 0.5 && uPass < 0.5 && dist * dist > 2.0 * R_EFF * uGround.z) {
+    float rowEdge = uHorizon + uFocal * sqrt(2.0 * uGround.z / R_EFF);
+    open *= 1.0 - saturate((p.y - rowEdge) * (uRes.y / uView.y) + 0.5);
+  }
+  return open;
+}
+
+// What lies between the eye and something at distance dist: the air (through:
+// what it transmits), the part of the clouds in front (front: what they
+// transmit, glow: their own light) and the rain in front (clear: what it
+// transmits).
+void propBetween(float2 p, float2 uv, float dist, out float3 through, out float front, out float3 glow, out float clear) {
+  through = airThrough(dist, uGround.w, uPropAir.y);
+  float4 cloud;
+  float2 cloudZ;
+  cloudsAt(p, dirOf(p), cloud, cloudZ);
+  float tBack;
+  float3 lightBack;
+  cloudSplit(cloud, cloudZ, dist, front, glow, tBack, lightBack);
+  float3 rain = uStorm.y > 0.001 ? tRain.SampleLevel(sClamp, uv, 0.0).rgb : 0.0;
+  clear = rain.r > 1e-4 ? pow(max(1.0 - rain.r, 1e-4), rainBefore(rain, dist)) : 1.0;
+}
+
+// Sets the work image into the sky.
+float4 Prop(float4 pos : SV_Position) : SV_Target {
+  // Several pixels of the work image per pixel, or, for something very near, less
+  // than one.
+  int per = max(int(uPropWork.z), 1), samples = int(uPropWork.w);
+  float2 cell = floor(pos.xy - uPropWork.xy);
+  int2 base = uPropWork.z >= 1.0 ? int2(cell) * per : int2((cell + 0.5) * uPropWork.z);
+  float4 sum = 0.0;
+  for (int j = 0; j < per; j++) {
+    for (int i = 0; i < per; i++) {
+      for (int k = 0; k < samples; k++) sum += tPropWork.Load(base + int2(i, j), k);
+    }
+  }
+  sum /= float(per * per * samples);
+  if (sum.a < 0.002) discard;
+  float2 uv = pos.xy / uRes;
+  float2 p = uv * uView;
+  float dist = uPropAir.x;
+  float cover = sum.a * propOpen(p, dist);
+  if (cover < 0.002) discard;
+
+  // The air in between as in front of the land, then the clouds, then the rain.
+  float3 haze = tHaze.SampleLevel(sClamp, float2(uv.x, 0.5), 0.0).rgb;
+  haze = lerp(haze, luma(haze) * float3(0.86, 0.89, 0.95) * (1.0 - 0.4 * uStorm.x), 0.9 * uLand.y);
+  float3 veil = lerp(haze, luma(haze) * float3(0.94, 0.98, 1.05), 0.35);
+  float3 through, glow;
+  float front, clear;
+  propBetween(p, uv, dist, through, front, glow, clear);
+  float3 col = sum.rgb / sum.a * uExposure * through + veil * (1.0 - through);
+  col = col * front + glow;
+  col = col * clear + rainLight() * ((1.0 - clear) * uExposure);
+  if (uShow > 0.5) return float4(develop(col) + (hash12(pos.xy + 0.37) + hash12(pos.yx * 1.31 + 7.7) - 1.0) / 255.0, cover);
+  return float4(col, cover);
+}
+
+// A lamp on a ship or an aircraft: a point of light, drawn as a small soft disc.
+// uPropRect: its position in pixels of the target and the radius of the disc;
+// uPropWing: its light. In the image for the eye it is laid over what is there
+// by its brightness, because that image holds finished colors; into the others
+// its light is added, and a counts it as lamp light for the water.
+float4 Lamp(float4 pos : SV_Position) : SV_Target {
+  float2 d = (pos.xy - uPropRect.xy) / uPropRect.z;
+  float2 uv = pos.xy / uRes;
+  float2 p = uv * uView;
+  float dist = uPropAir.x;
+  float3 through, glow;
+  float front, clear;
+  propBetween(p, uv, dist, through, front, glow, clear);
+  float3 col = uPropWing.rgb * through * (exp(-dot(d, d)) * propOpen(p, dist) * front * clear * uExposure);
+  float peak = max(col.r, max(col.g, col.b));
+  if (peak < 1e-4) discard;
+  if (uShow > 0.5) return float4(pow(col / peak, 1.0 / 2.2), 1.0 - exp(-1.6 * peak));
+  return float4(col, luma(col));
 }
 
 // Search for a good start: a different wind shift per pixel, the result is the
