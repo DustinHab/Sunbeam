@@ -48,6 +48,9 @@ const double SCENE_EVERY = 0.25; // the window positions are re-read at least th
 const int ICONS_EVERY_MS = 1500;
 const int SETTINGS_LEVEL = 5;    // increases when defaults have been retuned
 
+// The slider Temperature at its left end: no fixed value, the season decides.
+const float SEASON = -100;
+
 struct Setting {
   const wchar_t* key;
   float Params::* field;
@@ -92,6 +95,10 @@ struct App {
   std::wstring placeState;          // shown below the field while searching or after a failed search
   bool goalSet = false;             // a report has already arrived
   float goalClouds = 0, goalWind = 0;   // the sliders glide to these values
+  WeatherNow report;                // the latest report
+  float manualFog = 0;              // the slider Fog as set by hand
+  float manualTemperature = SEASON; // the slider Temperature as set by hand; SEASON: it follows the season
+  bool climateSet = false;          // fog and temperature have been applied once
   bool dragMoon = false;            // the grip holds the moon, not the sun
 
   ComPtr<ID3D11Device> dev;
@@ -224,6 +231,7 @@ void writeDegrees(const wchar_t* key, double v) {
 }
 
 void saveSettings();
+bool applyClimate(bool snap);
 
 void loadSettings() {
   Params before = app->par;
@@ -271,6 +279,13 @@ void loadSettings() {
   app->realWeather = readNumber(L"RealWeather", 0) > 0.5f;
   app->manualClouds = p.clouds, app->manualWind = p.wind;
   if (app->realWeather && app->weatherOn && app->goalSet) app->par.clouds = before.clouds, app->par.wind = before.wind;
+  app->manualFog = std::clamp(readNumber(L"Fog", 0), 0.0f, 1.0f);
+  app->manualTemperature = readNumber(L"Temperature", SEASON);
+  if (app->manualTemperature > -50) app->manualTemperature = std::clamp(app->manualTemperature, -20.0f, 35.0f);
+  // What the image shows of fog and temperature stays until applyClimate decides
+  // anew.
+  app->par.fog = before.fog, app->par.temperature = before.temperature;
+  app->par.dayTemperature = before.dayTemperature, app->par.snowDepth = before.snowDepth;
   app->sunX = std::clamp(readNumber(L"SunX", app->sunX), 0.0f, 1.0f);
   app->sunY = std::clamp(readNumber(L"SunY", app->sunY), 0.0f, 1.0f);
   app->course = std::clamp(int(readNumber(L"Course", float(app->course))), 0, 2);
@@ -300,6 +315,8 @@ void saveSettings() {
     writeNumber(L"Clouds", app->manualClouds);
     writeNumber(L"Wind", app->manualWind);
   }
+  writeNumber(L"Fog", app->manualFog);
+  writeNumber(L"Temperature", app->manualTemperature);
   app->iniTime = fileTime(app->ini);
 }
 
@@ -368,11 +385,15 @@ void tickWeather() {
     weatherSliders(w, app->goalClouds, app->goalWind);
     bool first = !app->goalSet;
     app->goalSet = true;
-    logf(L"Weather: cloud cover %.0f %%, precipitation %.1f mm/h, wind %.1f m/s, gusts %.1f m/s, code %d; clouds %.2f, wind %.2f", w.cover * 100,
-         w.rain, w.wind, w.gust, w.code, app->goalClouds, app->goalWind);
+    app->report = w;
+    logf(L"Weather: cloud cover %.0f %%, precipitation %.1f mm/h, wind %.1f m/s, gusts %.1f m/s, code %d, %.1f degrees (day %.1f), visibility %.0f m, "
+         L"snow %.2f m; clouds %.2f, wind %.2f, fog %.2f",
+         w.cover * 100, w.rain, w.wind, w.gust, w.code, w.temperature, w.dayTemperature, w.visibility, w.snowDepth, app->goalClouds, app->goalWind,
+         weatherFog(w));
     // As long as the sky is not visible at all yet, it applies immediately.
     if (first && !app->skyUp) {
       app->par.clouds = app->goalClouds, app->par.wind = app->goalWind;
+      applyClimate(true);
       app->render.setParams(app->par);
       return;
     }
@@ -383,6 +404,48 @@ void tickWeather() {
   if (clouds == app->par.clouds && wind == app->par.wind) return;
   app->par.clouds = clouds, app->par.wind = wind;
   app->render.drift(clouds, wind);
+}
+
+// Fog, temperature and snow for the image. With live weather they come from the
+// report, otherwise from the sliders; the slider Temperature at its left end
+// follows the season at the place. The temperature is that at the viewer: the
+// mountain view is from far above the place the weather is for, and colder by
+// 6.5 degrees per kilometer. snap: at once, as after a user change; otherwise
+// gliding. Returns whether the image has to follow with setParams.
+bool applyClimate(bool snap) {
+  Params& p = app->par;
+  float altitude = Renderer::altitudeOf(p);
+  float fog = app->manualFog, now = app->manualTemperature, day = app->manualTemperature, depth = -1;
+  if (app->weatherOn && app->goalSet) {
+    const WeatherNow& w = app->report;
+    float colder = float(LAPSE * (altitude - w.elevation));
+    fog = weatherFog(w);
+    now = w.temperature - colder;
+    day = w.dayTemperature - colder;
+    // The snow depth is that at the place; high above it the snow line decides.
+    if (altitude - w.elevation < 300) depth = w.snowDepth;
+  } else if (app->manualTemperature < -50) {
+    double shown = app->course == TIME_LAPSE && app->lapseTime > 0 ? app->lapseTime : clockNow();
+    seasonTemperature(app->latitude, app->longitude, shown, now, day);
+    now -= float(LAPSE * altitude), day -= float(LAPSE * altitude);
+  }
+  if (snap || !app->climateSet) {
+    bool changed = p.fog != fog || p.temperature != now || p.dayTemperature != day || p.snowDepth != depth;
+    p.fog = fog, p.temperature = now, p.dayTemperature = day, p.snowDepth = depth;
+    app->climateSet = true;
+    return changed;
+  }
+  // In small steps, and only when it adds up to something: a twentieth of a
+  // degree, half a percent of fog.
+  if (std::abs(fog - p.fog) < 0.005f && std::abs(now - p.temperature) < 0.05f && std::abs(day - p.dayTemperature) < 0.05f && depth == p.snowDepth) {
+    return false;
+  }
+  p.fog += std::clamp(fog - p.fog, -0.02f, 0.02f);
+  p.temperature += std::clamp(now - p.temperature, -0.25f, 0.25f);
+  p.dayTemperature += std::clamp(day - p.dayTemperature, -0.25f, 0.25f);
+  p.snowDepth = depth;
+  app->render.drift(p.fog, p.temperature, p.dayTemperature, p.snowDepth);
+  return false;
 }
 
 // Places sun and moon in the sky: where they were put by hand, where they are by
@@ -657,8 +720,11 @@ void openSettings() {
   h.render = &app->render;
   h.icon = app->tray.hIcon;
   h.shownTime = [] { return app->course == TIME_LAPSE && app->lapseTime > 0 ? app->lapseTime : clockNow(); };
+  h.fog = &app->manualFog;
+  h.temperature = &app->manualTemperature;
   h.changed = [](bool done) {
     syncWeather();
+    applyClimate(true);
     app->render.setParams(app->par);
     app->sceneEvent = true;
     if (done) saveSettings();
@@ -1475,10 +1541,12 @@ void run() {
       if (CompareFileTime(&ft, &app->iniTime) != 0) {
         loadSettings();
         syncWeather();
+        applyClimate(true);
         app->render.setParams(app->par);
         app->sceneEvent = true;
       }
       tickWeather();
+      applyClimate(false);
     }
     if (app->paused) continue;
     if (app->sceneEvent || t - lastScene > SCENE_EVERY) {
@@ -1610,6 +1678,7 @@ int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir
   guessPlace(app->latitude, app->longitude);
   loadSettings();
   syncWeather();
+  applyClimate(true);
   if (fresh) saveSettings();
 
   registerClasses();

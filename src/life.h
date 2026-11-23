@@ -31,6 +31,8 @@ struct Surroundings {
   double windX = 0, windZ = -1; // where it blows to: right, ahead
   double night = 0;             // 0 day, 1 night
   double rain = 0;              // 0 to 1
+  double fog = 0;               // 0 to 1
+  double temperature = 12;      // degrees Celsius
   double halfWidth = 0.45;      // half the image width as a tangent
   double top = 0.4;             // the image reaches this far above the horizon, as a tangent
   double amount = 0.5;          // the slider: 0 nothing, 1 twice as often as at half

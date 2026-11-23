@@ -188,7 +188,8 @@ float rainVeil(float3 d, float jit, out float dist, out float deep) {
     float t = tEnd * f * f;
     float len = t - before;
     before = t;
-    float ext = RAIN_EXT * rainRate(o + d * t);
+    // Snow hides what is behind it much sooner than rain of the same strength.
+    float ext = RAIN_EXT * (1.0 + 1.5 * uSnow.x) * rainRate(o + d * t);
     if (ext <= 0.0) continue;
     float tr = exp(-ext * len);
     float part = T * (1.0 - tr);
@@ -205,9 +206,9 @@ float rainVeil(float3 d, float jit, out float dist, out float deep) {
 }
 
 // Rain scatters the light that remains below the clouds: gray, slightly brighter
-// than their undersides.
+// than their undersides. Falling snow is whiter and brighter.
 float3 rainLight() {
-  return float3(0.84, 0.90, 1.0) * ((luma(uAmb) * 0.6 + luma(uCloudCol) * (SUN_E * 0.006)) * (1.0 - 0.4 * uStorm.x));
+  return float3(0.84, 0.90, 1.0) * ((1.0 + 0.4 * uSnow.x) * (luma(uAmb) * 0.6 + luma(uCloudCol) * (SUN_E * 0.006)) * (1.0 - 0.4 * uStorm.x));
 }
 
 // Light that a position in the cloud scatters toward the viewer, per unit of

@@ -135,8 +135,11 @@ void build(Panel& p) {
 
   auto& sky = p.rows[1];
   // Above 100 % the cloud deck closes, then it rains, then the thunderstorm comes.
-  auto weather = [](float v) {
-    return v > 1.62f ? std::wstring(L"Thunderstorm") : v > 1.3f ? std::wstring(L"Rain") : v > 1.04f ? std::wstring(L"Overcast") : percent(v);
+  // In the cold, snow falls instead of rain, and there is no thunderstorm.
+  auto weather = [par = h.par](float v) {
+    bool snow = par->temperature < 1.0f;
+    return v > 1.62f ? std::wstring(snow ? L"Heavy snow" : L"Thunderstorm") : v > 1.3f ? std::wstring(snow ? L"Snow" : L"Rain")
+                                                                                         : v > 1.04f ? std::wstring(L"Overcast") : percent(v);
   };
   // Live weather: clouds and wind then follow the weather at the place on the Sun
   // page.
@@ -156,6 +159,19 @@ void build(Panel& p) {
   Row wind = with(slider(L"Wind", &h.par->wind, 0, 1), fresh.wind);
   wind.locked = live;
   sky.push_back(wind);
+  // Fog and temperature: what was set by hand, or with live weather what the
+  // image shows right now. The temperature at its left end follows the season.
+  if (h.fog && h.temperature) {
+    Row fog = with(slider(L"Fog", h.fog, 0, 1), 0.0f);
+    fog.get = [f = h.fog, par = h.par, live] { return live() ? par->fog : *f; };
+    fog.locked = live;
+    sky.push_back(fog);
+    Row warm = slider(L"Temperature", h.temperature, -21, 35, [](float v) { return v < -20.5f ? std::wstring(L"Season") : number(v, 0) + L" °C"; }, 1);
+    warm.get = [f = h.temperature, par = h.par, live] { return live() ? std::clamp(par->temperature, -20.0f, 35.0f) : std::max(*f, -21.0f); };
+    warm.set = [f = h.temperature](float v) { *f = v < -20.5f ? -100.0f : v; };
+    warm.locked = live;
+    sky.push_back(with(warm, -21.0f));
+  }
   sky.push_back(with(slider(L"Stars", &h.par->stars, 0, 2), fresh.stars));
   sky.push_back(with(slider(L"Moonlight", &h.par->moonlight, 0, 3), fresh.moonlight));
   sky.push_back(with(slider(L"Life", &h.par->life, 0, 1), fresh.life));

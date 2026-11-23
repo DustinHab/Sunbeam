@@ -64,6 +64,10 @@ struct Params {
   float rays = 0.3f;          // Rays: fine ray needles around the sun
   float clouds = 0.5f;        // Clouds: up to 1 more clouds, above that overcast, rain, thunderstorm (up to 2)
   float wind = 0.5f;          // Wind
+  float fog = 0.0f;           // Fog: 0 none, up to 1 a visibility of 100 m
+  float temperature = 12.0f;  // degrees Celsius at the viewer: around freezing, snow falls instead of rain
+  float dayTemperature = 12.0f;   // its mean over the day: decides where snow lies
+  float snowDepth = -1.0f;    // snow on the ground at the viewer in meters; negative: follows from the temperature
   float exposure = 1.0f;      // Brightness
   float bloom = 0.55f;        // Glare
   float rim = 0.8f;           // Rim light
@@ -126,6 +130,13 @@ class Renderer {
   // Clouds and wind glide to these values without the sky starting over (live
   // weather).
   void drift(float clouds, float wind);
+  // Likewise fog, temperature and snow: the image follows without anything
+  // starting over.
+  void drift(float fog, float temperature, float dayTemperature, float snowDepth);
+  // Height of the viewer above the sea in meters, for the ground chosen in p.
+  static float altitudeOf(const Params& p);
+  // The fraction of what falls from the clouds that is snow, 0 to 1.
+  float snowing() const;
   // One frame, dt seconds after the previous one. Both targets have the size of
   // the surface.
   Drawn render(double dt, ID3D11RenderTargetView* skyOut, ID3D11RenderTargetView* lightOut);
@@ -227,6 +238,8 @@ class Renderer {
     float skyLand[3] = {0, 0, 0};      // sky light on a bright surface at the ground
     float alt = 0.3f;                  // its true altitude in radians
     float lights = 0;                  // how bright the lights of the city are
+    float fog[3] = {0, 0, 0};          // the light that fog scatters toward the viewer
+    float fogGlare = 0;                // strength of the glare around the light source in fog
   };
   // A model of something that moves through the image.
   struct Mesh {
@@ -273,6 +286,7 @@ class Renderer {
   void makeWaves();
   void setSea();
   double surfSpeed() const;
+  double fallSpeed() const;
   void bindGround(bool mirror);
   void drawWaterMaps(bool sums, bool shade);
   void faceUpper();

@@ -254,11 +254,14 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
               {"OverSky", &Params::overSky}, {"Shadows", &Params::shade},        {"Wind", &Params::wind},
               {"Stars", &Params::stars},        {"Moonlight", &Params::moonlight},   {"HdrGlow", &Params::glow},
               {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground},
-              {"Life", &Params::life}};
+              {"Life", &Params::life},         {"Fog", &Params::fog},          {"Temperature", &Params::temperature},
+              {"DayTemperature", &Params::dayTemperature}, {"SnowDepth", &Params::snowDepth}};
   char key[64];
   float v;
+  bool day = false;
   while (fscanf_s(in, "%63s %f", key, unsigned(sizeof(key)), &v) == 2) {
     if (!strcmp(key, "Shift")) shift = v;
+    day |= !strcmp(key, "DayTemperature");
     for (const auto& k : keys) {
       if (!strcmp(key, k.key)) {
         p.*k.field = v;
@@ -266,6 +269,8 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
       }
     }
   }
+  // Without a mean of its own the day is as warm as the moment.
+  if (!day) p.dayTemperature = p.temperature;
   fclose(in);
   return true;
 }
@@ -1263,6 +1268,9 @@ int runPanelCheck(const std::wstring& dir) {
   // If the folder contains a weather.txt, the switch for live weather is on.
   bool real = GetFileAttributesW((dir + L"\\weather.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
   h.realWeather = &real;
+  float fog = 0, temperature = -100;
+  h.fog = &fog;
+  h.temperature = &temperature;
   h.place = [] { return std::wstring(L"Berlin, Germany"); };
   h.placeNote = [&] { return coordinateText(latitude, longitude); };
   return renderPanel(dir, h, 1.5f) ? 0 : 5;
@@ -1317,6 +1325,11 @@ int runWeatherCheck(const std::wstring& dir, const std::wstring& query) {
     weatherSliders(now, clouds, wind);
     fprintf(log, "Request for %.1f %.1f: cloud cover %.0f %%, precipitation %.1f mm/h, wind %.1f m/s, gusts %.1f m/s, code %d, %.1f degrees; clouds %.2f, wind %.2f\n",
             latitude, longitude, now.cover * 100, now.rain, now.wind, now.gust, now.code, now.temperature, clouds, wind);
+    fprintf(log, "  mean of the day %.1f degrees, visibility %.0f m, snow %.2f m, place at %.0f m; fog %.2f\n", now.dayTemperature, now.visibility,
+            now.snowDepth, now.elevation, weatherFog(now));
+    float seasonNow = 0, seasonDay = 0;
+    seasonTemperature(latitude, longitude, double(std::time(nullptr)), seasonNow, seasonDay);
+    fprintf(log, "  by the season alone: %.1f degrees now, %.1f as the mean of the day\n", seasonNow, seasonDay);
   } else {
     fprintf(log, "Request for %.1f %.1f failed: %s\n", latitude, longitude, error.c_str());
   }

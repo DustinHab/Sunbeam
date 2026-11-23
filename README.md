@@ -29,6 +29,13 @@ windows.
   lightning. Lightning lights clouds, rain and the desktop the way the sun does.
 - **Wind** moves the clouds (the high layer on a wind of its own), slants the
   rain, raises the sea and carries the dust in the light shafts.
+- **Cold**: around freezing, snow falls instead of rain. In the mountains snow
+  lies above a snow line that follows the temperature, down to a white winter
+  panorama; in the city it lies on roofs. Without a temperature of your own the
+  season at your place decides.
+- **Fog** lies on water and in valleys: mist that leaves the towers of the
+  skyline standing above it, a sea of fog below the mountains, or dense fog
+  with a pale sun. Thin fog drifts in banks.
 - **Ground**: mountains (Bernese Oberland, from swisstopo terrain data), a
   skyline (Chicago, from a USGS lidar scan) or sea. Land is lit for any time of
   day; the city switches its lights on at dusk.
@@ -42,8 +49,8 @@ windows.
   passes.
 - **Light**: a click-through layer above all windows adds scattered light and
   shadows, rim light on window edges and dust. HDR displays are supported.
-- **Live weather** (optional) sets clouds, rain, thunderstorms and wind from
-  the current weather at your place.
+- **Live weather** (optional) sets clouds, rain or snow, thunderstorms, wind,
+  fog and temperature from the current weather at your place.
 
 Sunbeam rests while a full-screen application or a maximized window covers the
 desktop.
@@ -97,8 +104,13 @@ Two things use the network, and only then:
   [Open-Meteo](https://open-meteo.com/). Coordinates are not looked up.
 - **Live weather** on the page **Sky** is off by default. When on, the program
   asks Open-Meteo every 15 minutes for the current weather at the location,
-  rounded to a tenth of a degree. Snow and fog are not drawn yet; both appear
-  as a closed cloud deck.
+  rounded to a tenth of a degree. The temperature is carried up to the viewer:
+  the mountain view is from 2365 m, about 15 degrees colder than a place in the
+  lowlands, so rain down there is often snow up here.
+
+Without live weather the sliders **Fog** and **Temperature** apply. Temperature
+at its left end reads **Season**: a rough climate from the latitude of the
+location and the date, warmer in the afternoon than at night.
 
 Open-Meteo is free for non-commercial use without a key; see their
 [terms](https://open-meteo.com/en/terms).
@@ -145,7 +157,10 @@ The formats of the input files are described at the functions in
 
 - One display; no reaction to a lost graphics device.
 - Wind direction is fixed; live weather sets only its strength.
-- No snow, no fog, no sound.
+- No sound.
+- Snow lies on the land but does not pile up on ships or freeze the water; the
+  season knows the latitude, not the climate of a particular place.
+- Fog is a level layer with banks; it has no relief when seen from above.
 - Water is a flat surface with tilted reflections; tall waves do not hide what
   is behind them.
 - The skyline is missing one tower that was built after the lidar scan of 2017.

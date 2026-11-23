@@ -72,8 +72,11 @@ struct SkyC {
   float flashCol[4];
   float flashMore[4];
   float wind[4];
+  float snow[4];
+  float fog[4];
+  float fogCol[4];
 };
-static_assert(sizeof(SkyC) == 464);
+static_assert(sizeof(SkyC) == 512);
 
 const int WAVES = 160;   // as in shader\ground.hlsli
 const int SWELL = 8;     // the last of them are swell
@@ -171,6 +174,7 @@ const double CLOUD_WRAP = 625;      // after this many tiles of shift the clouds
 const double SURF_X = -0.747, SURF_Z = -0.665;   // its direction (right, ahead), as in sky.hlsl
 const double SURF_MAX = 17;         // meters per second at the ground at full slider
 const double RAIN_SPEED = 8;        // the drops fall this fast, meters per second
+const double SNOW_SPEED = 1.4;      // and snowflakes this fast
 const double FOAM_FULL = 0.028;     // fraction of the area under foam when at 17 m/s every wave breaks in every cell
 const double EVOLVE_MAX = 0.0012;   // the shapes evolve this fast at full slider, in tiles per second
 const double SKY_EVERY = 0.05;      // seconds between two cloud passes while the clouds drift
@@ -330,15 +334,19 @@ struct Ground {
   float swell;               // steepness of the swell: long waves from far away that the wind does not change
   float shelter;             // fraction of the wind that reaches the water (for the whitecaps)
   float cloudLift;           // the clouds are this much higher above the viewer, meters
+  float fogTop[2];           // fog reaches up to this height above the sea: thin fog, dense fog
 };
 const Ground GROUNDS[] = {
     // Over the mountains the cloud base is above the highest peaks in the image;
-    // otherwise all of them would be in clouds.
-    {{L"MOUNTAINS_A", L"MOUNTAINS_B", L"MOUNTAINS_C", nullptr}, false, 0, 2365, {0, 0, 0}, {1, 1, 1}, {1, 1, 1}, 0, 0, 550},
+    // otherwise all of them would be in clouds. Fog fills the valleys far below the
+    // viewer: a sea of fog.
+    {{L"MOUNTAINS_A", L"MOUNTAINS_B", L"MOUNTAINS_C", nullptr}, false, 0, 2365, {0, 0, 0}, {1, 1, 1}, {1, 1, 1}, 0, 0, 550, {1250, 1950}},
     // In front of the city the water is sheltered: almost a mirror at half wind,
-    // choppy only in strong wind.
-    {{L"CITY_A", L"CITY_B", L"CITY_C", L"CITY_D"}, true, 9, 186, {0.006f, 0.018f, 0.024f}, {0.000003f, 0.001f, 0.006f}, {0.2f, 20, 32}, 0.0006f, 0.4f, 0},
-    {{nullptr, nullptr, nullptr, nullptr}, true, 26, 26, {0.004f, 0.016f, 0.045f}, {0.00005f, 0.014f, 0.07f}, {0.25f, 60, 110}, 0.006f, 1, 0},
+    // choppy only in strong wind. Fog lies on the lake; thin fog leaves the towers
+    // standing above it.
+    {{L"CITY_A", L"CITY_B", L"CITY_C", L"CITY_D"}, true, 9, 186, {0.006f, 0.018f, 0.024f}, {0.000003f, 0.001f, 0.006f}, {0.2f, 20, 32}, 0.0006f, 0.4f, 0,
+     {177 + 30, 177 + 420}},
+    {{nullptr, nullptr, nullptr, nullptr}, true, 26, 26, {0.004f, 0.016f, 0.045f}, {0.00005f, 0.014f, 0.07f}, {0.25f, 60, 110}, 0.006f, 1, 0, {40, 420}},
 };
 const int GROUND_COUNT = int(std::size(GROUNDS));
 // The strip: this much tangent is above the horizon, this much it measures in
@@ -367,6 +375,46 @@ Sky skyOf(float clouds) {
 }
 
 int groundOf(const Params& p) { return std::clamp(int(std::lround(p.ground)), 0, GROUND_COUNT - 1); }
+
+// What follows from the temperature. Between freezing and two degrees above it,
+// rain turns into snow. Snow lies from the height at which the mean of the day
+// is at freezing; the air cools by 6.5 degrees per kilometer.
+struct Cold {
+  float snow;    // fraction of what falls that is snow
+  float line;    // snow lies above this height above the sea, meters
+  float cover;   // snow on the ground at the viewer's level, 0 to 1
+};
+
+Cold coldOf(const Params& p) {
+  Cold c;
+  c.snow = float(1 - smooth(0.3, 1.8, p.temperature));
+  c.line = GROUNDS[groundOf(p)].eyeSea + p.dayTemperature / 0.0065f;
+  c.cover = p.snowDepth >= 0 ? float(smooth(0.004, 0.03, p.snowDepth)) : float(1 - smooth(-1.5, 1.0, p.dayTemperature));
+  return c;
+}
+
+// The fog for the slider: a layer over the ground whose visibility falls from
+// 10 km to 150 m (extinction after Koschmieder, as in weather.cpp; the ordinary
+// air at 10 km is left to the haze) and whose top rises as it thickens. Thin fog
+// lies in banks, dense fog is closed.
+struct Fog {
+  float ext;     // extinction per meter inside the layer
+  float top;     // its top above the sea, meters
+  float soft;    // depth of the transition at the top
+  float banks;   // how patchy it is
+};
+
+Fog fogOf(const Params& p) {
+  const Ground& g = GROUNDS[groundOf(p)];
+  double f = std::clamp(double(p.fog), 0.0, 1.0);
+  Fog o;
+  o.ext = f <= 0.001 ? 0.0f : float(3.912 * (std::pow(10000.0 / 150.0, std::pow(f, 1.5)) - 1) / 10000.0);
+  o.top = float(g.fogTop[0] + (g.fogTop[1] - g.fogTop[0]) * f * f);
+  o.soft = float(0.3 * (o.top - (g.water ? g.eyeSea - g.eyeWater : g.fogTop[0] - 250)));
+  o.soft = std::clamp(o.soft, 8.0f, 90.0f);
+  o.banks = float(1 - smooth(0.35, 0.9, f));
+  return o;
+}
 
 bool resource(const wchar_t* name, const uint8_t*& data, size_t& size) {
   HRSRC found = FindResourceW(nullptr, name, RT_RCDATA);
@@ -1038,8 +1086,10 @@ void Renderer::updateLight() {
     skyMix[c] = 1.25 * (0.45 * up[c] + 0.55 * opp[c]) * l.gain + 0.32 * blue[c] * filled;
     skyLum += lumOf[c] * skyMix[c];
   }
-  // Under clouds it is gray, in a thunderstorm dark as well.
+  // Under clouds it is gray, in a thunderstorm dark as well. Snow clouds are
+  // paler than rain clouds.
   Sky wx = skyOf(par_.clouds);
+  wx.dark *= 1 - 0.7f * coldOf(par_).snow;
   const double grey[3] = {0.95, 0.98, 1.04};
   for (int c = 0; c < 3; c++) {
     double clear = 2.3 * (0.45 * skyMix[c] + 0.55 * skyLum * pale[c]);
@@ -1049,6 +1099,21 @@ void Renderer::updateLight() {
   l.alt = float(alt * PI / 180);
   // The lights of the city come on with the twilight.
   l.lights = float(1 - smooth(-6.5, 1.0, sunAlt));
+  // Fog scatters the light of the sky and of the light source in all directions
+  // and loses hardly any of it: it is about as bright as a white surface under
+  // the open sky, a little grayer, and in the light of city lamps at night warm.
+  // Around the light source it glares, unless clouds hide it.
+  const double lamp[3] = {1.0, 0.78, 0.5};
+  const bool city = land_[3] != nullptr;
+  for (int c = 0; c < 3; c++) {
+    double lum = 0.2126 * l.skyLand[0] + 0.7152 * l.skyLand[1] + 0.0722 * l.skyLand[2];
+    double sun = 0.2126 * l.land[0] + 0.7152 * l.land[1] + 0.0722 * l.land[2];
+    // Scattered many times, the light of the source loses most of its color.
+    l.fog[c] = float(0.62 * (0.6 * l.skyLand[c] + 0.4 * lum) +
+                     0.42 * (0.35 * l.land[c] + 0.65 * sun) * std::max(std::sin(alt * PI / 180), 0.0) * (1 - 0.75 * wx.closed) +
+                     (city ? 0.02 * lamp[c] * l.lights : 0.0));
+  }
+  l.fogGlare = float(0.3 * (1 - 0.85 * wx.closed));
 
   // Exposure as with a camera: short while the sun is in the image, so that the
   // sky keeps its color; twilight and night need more.
@@ -1248,8 +1313,9 @@ void Renderer::setParams(const Params& p) {
              p.stars != par_.stars || p.moonlight != par_.moonlight || p.ground != par_.ground;
   bool res = p.resolution != par_.resolution;
   // The haze also lies between eye and ground: the finished image needs it anew,
-  // the clouds do not.
-  if (p.density != par_.density) faceDue_ = true;
+  // the clouds do not. The same goes for fog and for what the temperature decides.
+  bool air = p.fog != par_.fog || p.temperature != par_.temperature || p.dayTemperature != par_.dayTemperature || p.snowDepth != par_.snowDepth;
+  if (p.density != par_.density || air) faceDue_ = true;
   par_ = p;
   if (!dev_ || !sky_.tex) return;
   sizeBodies();
@@ -1257,9 +1323,22 @@ void Renderer::setParams(const Params& p) {
   if (sky) {
     updateLight();
     skyDirty_ = true;
+  } else if (air) {
+    updateLight();
   }
   updateDepths();
   sceneDirty_ = true;
+}
+
+void Renderer::drift(float fog, float temperature, float dayTemperature, float snowDepth) {
+  if (fog == par_.fog && temperature == par_.temperature && dayTemperature == par_.dayTemperature && snowDepth == par_.snowDepth) return;
+  par_.fog = fog;
+  par_.temperature = temperature;
+  par_.dayTemperature = dayTemperature;
+  par_.snowDepth = snowDepth;
+  if (!dev_ || !sky_.tex) return;
+  updateLight();
+  faceDue_ = true;
 }
 
 // Shared quantities of the sky shaders. shift is the wind shift of the clouds,
@@ -1308,8 +1387,15 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.stars = par_.stars;
   c.span = float(columnTop_), c.count = float(columnH_);
   Sky wx = skyOf(par_.clouds);
+  const Cold cold = coldOf(par_);
+  const Fog fog = fogOf(par_);
+  wx.dark *= 1 - 0.7f * cold.snow;
   c.cover = wx.cover;
   c.storm[0] = wx.dark, c.storm[1] = wx.rain, c.storm[2] = rainHere_;
+  c.snow[0] = cold.snow, c.snow[1] = cold.line, c.snow[2] = cold.cover;
+  c.fog[0] = fog.ext, c.fog[1] = fog.top, c.fog[2] = fog.soft, c.fog[3] = fog.banks;
+  for (int i = 0; i < 3; i++) c.fogCol[i] = l.fog[i];
+  c.fogCol[3] = l.fogGlare;
   c.storm[3] = float(std::fmod(time_, 64.0));
   // The lightning: bluish white, far brighter than everything else below the
   // clouds.
@@ -1346,7 +1432,9 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   // The wind at the ground: how far the gust fields have moved over the water, how
   // slanted the rain falls, how often waves break.
   c.strip[3] = float(gustT_);
-  c.wind[0] = float(surfSpeed() / RAIN_SPEED);
+  c.wind[0] = float(std::min(surfSpeed() / fallSpeed(), 3.0));
+  // Flakes close to the viewer fall slower still and nearly ride on the wind.
+  c.snow[3] = float(std::min(surfSpeed() / SNOW_SPEED, 4.0));
   c.wind[1] = float(surfSpeed() * g.shelter);
   c.wind[2] = foamOdds_;
   c.wind[3] = foamCover_;
@@ -1584,11 +1672,24 @@ float Renderer::cloudDensity(double x, double z) const {
 // The weather at the viewer's location: rain falls when a dense cloud passes
 // above it.
 // snap: the new state at once, otherwise gliding.
+float Renderer::altitudeOf(const Params& p) { return GROUNDS[groundOf(p)].eyeSea; }
+
+float Renderer::snowing() const { return coldOf(par_).snow; }
+
+// How fast what falls from the clouds falls, meters per second: rain fast, snow
+// slowly.
+double Renderer::fallSpeed() const {
+  double snow = coldOf(par_).snow;
+  return RAIN_SPEED + (SNOW_SPEED - RAIN_SPEED) * snow;
+}
+
 void Renderer::updateWeather(double dt, bool snap) {
   Sky wx = skyOf(par_.clouds);
   // The wind carries the rain along as it falls: what arrives at the viewer's
-  // location fell from a cloud that is farther upwind.
-  double carried = surfSpeed() / RAIN_SPEED * (750.0 + GROUNDS[groundOf(par_)].cloudLift);
+  // location fell from a cloud that is farther upwind. Snow is carried much
+  // farther; beyond three times the height of fall the slant is capped, as in the
+  // image.
+  double carried = std::min(surfSpeed() / fallSpeed(), 3.0) * (750.0 + GROUNDS[groundOf(par_)].cloudLift);
   float shower = float(smooth(0.62 - 0.32 * wx.rain, 0.95 - 0.2 * wx.rain, cloudDensity(-SURF_X * carried, -SURF_Z * carried)));
   float want = wx.rain * (shower + (1 - shower) * 0.3f * wx.rain);
   rainHere_ = snap ? want : rainHere_ + (want - rainHere_) * float(std::min(1.0, dt / 2.5));
@@ -1811,7 +1912,9 @@ void Renderer::drawBolt() {
 void Renderer::updateFlash() {
   Flash& f = flash_;
   if (f.hold) return;
-  float thunder = skyOf(par_.clouds).thunder;
+  // No thunderstorm in snowfall: thunder in snow is so rare that it would look
+  // like a mistake.
+  float thunder = skyOf(par_.clouds).thunder * (1 - coldOf(par_).snow);
   if (f.on) {
     double t = time_ - f.start, last = f.at[f.strokes - 1];
     if (t < f.at[0] && thunder > 0.001f) {
@@ -2147,6 +2250,8 @@ bool Renderer::updateLife(double dt) {
   s.windX = SURF_X, s.windZ = SURF_Z;
   s.night = light_.night;
   s.rain = skyOf(par_.clouds).rain;
+  s.fog = par_.fog;
+  s.temperature = par_.temperature;
   s.halfWidth = 0.5 * viewW_ / focal();
   s.top = horizon() / focal();
   s.amount = par_.life;

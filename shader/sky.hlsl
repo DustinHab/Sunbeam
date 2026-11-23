@@ -68,6 +68,9 @@ cbuffer SkyC : register(b0) {
   float4 uFlashCol;  // its color, w: number of segments of its channel (0 = sheet lightning without a channel)
   float4 uFlashMore; // x: brightness of the main channel now, y: of the branches, z: of the sheet lightning, w: image row down to which the stepped leader has grown (very large: the channel is complete)
   float4 uWind;      // wind at the ground. x: slant of the rain (tangent of the angle to the vertical), y: wind over the water in m/s, z: how often waves break there (0 to 1), w: fraction of the water under foam if every wave breaks
+  float4 uSnow;      // x: fraction of what falls that is snow, y: height above the sea from which snow lies, z: snow on the ground at the viewer's level (0 to 1), w: slant of the snowfall
+  float4 uFog;       // fog: x extinction per meter in the layer, y height of its top above the sea, z depth of the transition at the top, w how much it lies in banks (0 to 1)
+  float4 uFogCol;    // its own light before exposure; w: strength of the glare around the light source
 };
 
 // The lightning channel as a sequence of short segments in the image.
@@ -700,9 +703,35 @@ float rainFall(float2 p) {
   return sum;
 }
 
-// The final sky image. uShow = 1 draws it including the sun disc for the screen;
-// 0 yields luminance without the disc, and transmittance, for the light layer
-// (there skyAt adds the disc with a sharp edge).
+// Snow close in front of the viewer: flakes in six layers, a few large ones in
+// front, many small ones behind. Each layer is a grid with one flake per cell;
+// the grid falls slowly and slides sideways with the wind at the ground, much
+// more than rain, and each flake sways on its way.
+float snowFall(float2 p) {
+  float sum = 0.0;
+  float lean = -SURF.x * uSnow.w;
+  float turn = uStorm.w * (6.2831853 / 64.0);
+  for (int k = 0; k < 6; k++) {
+    float far = float(k) * 0.2;
+    float cell = lerp(150.0, 34.0, far);
+    // Cells per second down and sideways, rounded to sixty-fourths: the time wraps
+    // after 64 s.
+    float fall = round(lerp(1.1, 1.9, far) * 64.0) / 64.0;
+    float slide = round(lean * fall * 64.0) / 64.0;
+    float2 q = float2(p.x / cell + uStorm.w * slide, p.y / cell - uStorm.w * fall) + 13.7 * float(k);
+    float2 id = floor(q), f = q - id;
+    float h = hash12(id + 17.0 * float(k)), h2 = hash12(id * 1.7 + 3.1 + float(k));
+    // The heavier the snowfall, the more cells hold a flake.
+    if (h > 0.2 + 0.8 * uStorm.z) continue;
+    float2 at = float2(0.3 + 0.4 * h2 + 0.09 * sin(16.0 * turn + 6.2831853 * h) + 0.05 * sin(11.0 * turn + 9.1 * h2),
+                       0.3 + 0.4 * frac(h * 7.3) + 0.03 * sin(13.0 * turn + 4.7 * h2));
+    float size = lerp(2.9, 1.0, far) / cell * (0.7 + 0.6 * frac(h2 * 5.7));
+    float2 d = (f - at) / size;
+    sum += exp(-dot(d, d)) * lerp(1.0, 0.6, far);
+  }
+  return sum;
+}
+
 // The clouds at a position in the image, in view direction toward: their light
 // and transmittance, and their mean distance and its spread in km (0 = none).
 // They are where the wind has carried them since their pass. When a new pass
@@ -728,6 +757,9 @@ void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   }
 }
 
+// The final sky image. uShow = 1 draws it including the sun disc for the screen;
+// 0 yields luminance without the disc, and transmittance, for the light layer
+// (there skyAt adds the disc with a sharp edge).
 float4 Face(float4 pos : SV_Position) : SV_Target {
   float2 uv = pos.xy / uRes;
   float2 p = uv * uView;
@@ -796,7 +828,18 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
     cloudSplit(cloud, cloudZ, boltFar, tF, lF, tB, lB);
     bolt *= tF;
   }
-  ground(p, toward, uv, sky, cloud, cloudZ, rain, boltFar, col, alpha, near, bolt);
+  float fogTau = uFog.x > 0.0 ? fogSky(toward) : 0.0;
+  ground(p, toward, uv, sky, cloud, cloudZ, rain, boltFar, col, alpha, near, bolt, fogTau);
+
+  // Fog lies in front of everything it reaches: ground, water, and the sky low
+  // above the horizon.
+  if (uFog.x > 0.0) {
+    float seen = exp(-fogTau);
+    col = col * seen + fogLight(toward, sunOpen) * (1.0 - seen);
+    alpha *= seen;
+    bolt *= seen;
+    landLights *= seen;
+  }
 
   // The rain lies in front as a gray veil.
   if (rain.r > 1e-4) {
@@ -808,8 +851,13 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
   }
   col += bolt * uExposure;
 
-  // Rain close in front of the viewer.
-  if (uShow > 0.5 && uStorm.z > 0.002) col += (uSkyLand * 0.3 + 0.01 + uFlashCol.rgb * (uFlash.w * 0.03 / (1.0 + dot(uFlash.xz, uFlash.xz) / 1.6e7))) * (rainFall(p) * uStorm.z * uExposure);
+  // Rain or snow close in front of the viewer. Flakes are white: they return far
+  // more of the light than drops.
+  if (uShow > 0.5 && uStorm.z > 0.002) {
+    float3 lit = uSkyLand * 0.3 + 0.01 + uFlashCol.rgb * (uFlash.w * 0.03 / (1.0 + dot(uFlash.xz, uFlash.xz) / 1.6e7));
+    if (uSnow.x < 0.999) col += lit * (rainFall(p) * uStorm.z * (1.0 - uSnow.x) * uExposure);
+    if (uSnow.x > 0.001) col += (lit * 2.4 + uSunLand * (0.06 * sunOpen)) * (snowFall(p) * uSnow.x * uExposure);
+  }
 
   // Fine noise against color banding in the gradients. From two random values, not
   // from a fixed grid: that appeared as hatching in the dark night sky.
@@ -927,6 +975,8 @@ PropLit PropIn(PropOut v) {
     l = lightDir(normalize(float3(uPropRow[0].w, uPropRow[1].w + uPropDepth.z, uPropRow[2].w)));
     if (uPropLight.z > 1.5) open = 1.0;
   }
+  // Fog above it takes the direct light.
+  open *= fogSun(uPropAir.y);
   float facing = saturate(dot(n, l));
   // Through sailcloth and feathers part of the light shines when it comes from
   // behind.
@@ -972,10 +1022,11 @@ float propOpen(float2 p, float dist) {
 
 // What lies between the eye and something at distance dist: the air (through:
 // what it transmits), the part of the clouds in front (front: what they
-// transmit, glow: their own light) and the rain in front (clear: what it
-// transmits).
-void propBetween(float2 p, float2 uv, float dist, out float3 through, out float front, out float3 glow, out float clear) {
+// transmit, glow: their own light), the rain in front (clear: what it
+// transmits) and the fog (seen: what it transmits).
+void propBetween(float2 p, float2 uv, float dist, out float3 through, out float front, out float3 glow, out float clear, out float seen) {
   through = airThrough(dist, uGround.w, uPropAir.y);
+  seen = uFog.x > 0.0 ? exp(-fogAlong(dirOf(p), dist, uPropAir.y)) : 1.0;
   float4 cloud;
   float2 cloudZ;
   cloudsAt(p, dirOf(p), cloud, cloudZ);
@@ -1012,10 +1063,11 @@ float4 Prop(float4 pos : SV_Position) : SV_Target {
   haze = lerp(haze, luma(haze) * float3(0.86, 0.89, 0.95) * (1.0 - 0.4 * uStorm.x), 0.9 * uLand.y);
   float3 veil = lerp(haze, luma(haze) * float3(0.94, 0.98, 1.05), 0.35);
   float3 through, glow;
-  float front, clear;
-  propBetween(p, uv, dist, through, front, glow, clear);
+  float front, clear, seen;
+  propBetween(p, uv, dist, through, front, glow, clear, seen);
   float3 col = sum.rgb / sum.a * uExposure * through + veil * (1.0 - through);
   col = col * front + glow;
+  col = col * seen + fogLight(dirOf(p), sunThrough()) * (1.0 - seen);
   col = col * clear + rainLight() * ((1.0 - clear) * uExposure);
   if (uShow > 0.5) return float4(develop(col) + (hash12(pos.xy + 0.37) + hash12(pos.yx * 1.31 + 7.7) - 1.0) / 255.0, cover);
   return float4(col, cover);
@@ -1032,9 +1084,9 @@ float4 Lamp(float4 pos : SV_Position) : SV_Target {
   float2 p = uv * uView;
   float dist = uPropAir.x;
   float3 through, glow;
-  float front, clear;
-  propBetween(p, uv, dist, through, front, glow, clear);
-  float3 col = uPropWing.rgb * through * (exp(-dot(d, d)) * propOpen(p, dist) * front * clear * uExposure);
+  float front, clear, seen;
+  propBetween(p, uv, dist, through, front, glow, clear, seen);
+  float3 col = uPropWing.rgb * through * (exp(-dot(d, d)) * propOpen(p, dist) * front * clear * seen * uExposure);
   float peak = max(col.r, max(col.g, col.b));
   if (peak < 1e-4) discard;
   if (uShow > 0.5) return float4(pow(col / peak, 1.0 / 2.2), 1.0 - exp(-1.6 * peak));

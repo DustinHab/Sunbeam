@@ -270,7 +270,7 @@ const std::vector<Prop>& Life::update(double dt, const Surroundings& s) {
   }
 
   // A dinghy sails by day, in a wind that carries it and does not overpower it,
-  // and not in the rain.
+  // and not in rain, fog or cold.
   if (boat_.on) {
     travel(boat_, dt);
     // It rocks in the waves.
@@ -280,7 +280,7 @@ const std::vector<Prop>& Life::update(double dt, const Surroundings& s) {
       boat_.on = false;
       boatIn_ = pause(BOAT_PAUSE);
     }
-  } else if (s.water && s.has[MODEL_DINGHY] && s.night < 0.25 && s.rain < 0.15 && s.wind > 2.0 && s.wind < 10.5) {
+  } else if (s.water && s.has[MODEL_DINGHY] && s.night < 0.25 && s.rain < 0.15 && s.wind > 2.0 && s.wind < 10.5 && s.fog < 0.3 && s.temperature > 4) {
     boatIn_ -= passed;
     if (boatIn_ <= 0) startBoat(s);
   }
@@ -296,7 +296,7 @@ const std::vector<Prop>& Life::update(double dt, const Surroundings& s) {
     if (planeIn_ <= 0) startPlane(s);
   }
 
-  // Gulls over water, by day, not in heavy rain or storm.
+  // Gulls over water, by day, not in heavy rain, storm or dense fog.
   bool flying = false;
   for (Actor& b : bird_) {
     if (!b.on) continue;
@@ -308,7 +308,7 @@ const std::vector<Prop>& Life::update(double dt, const Surroundings& s) {
     if (bird_[0].age > 0) {
       for (Actor& b : bird_) b = Actor();
       birdsIn_ = pause(BIRD_PAUSE);
-    } else if (s.water && s.has[MODEL_GULL] && s.night < 0.2 && s.rain < 0.35 && s.wind < 14) {
+    } else if (s.water && s.has[MODEL_GULL] && s.night < 0.2 && s.rain < 0.35 && s.wind < 14 && s.fog < 0.55) {
       birdsIn_ -= passed;
       if (birdsIn_ <= 0) startBirds(s);
     }

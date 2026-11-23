@@ -33,6 +33,7 @@ cbuffer WaveC : register(b1) {
 
 static float sunOpen = 1.0;                   // how much of the light source's light the clouds let through
 static float landLights = 0.0;                // brightness of the land's lights at this position in the image
+static float landHeight = 0.0;                // height above the sea of the land at this position in the image
 
 static const float R_EFF = 7433e3;            // Earth radius, enlarged to account for refraction
 static const float STRIP_W = 3840.0;          // width of the strip in points
@@ -57,6 +58,84 @@ float meanDensity(float h0, float h1, float scale) {
 // What the air transmits of the light over this distance.
 float3 airThrough(float dist, float h0, float h1) {
   return exp(-(K_RLH * meanDensity(h0, h1, SH_RLH) + K_MIE * 1.1 * uLand.z * meanDensity(h0, h1, SH_MIE)) * dist);
+}
+
+// Fog: a layer over the ground. Well below its top (uFog.y) it has its full
+// density, above it the density falls to nothing over a transition of depth
+// uFog.z. This is that density integrated from height h upward, in meters of
+// full density.
+float fogAbove(float h) {
+  float x = (h - uFog.y) / uFog.z;
+  return uFog.z * (x < -30.0 ? -x : log(1.0 + exp(min(-x, 30.0))));
+}
+
+// Optical depth of the fog along a straight path of length dist between the
+// heights h0 and h1 above the sea.
+float fogDepth(float dist, float h0, float h1) {
+  float dh = h1 - h0;
+  float mean = abs(dh) < 0.5 ? 1.0 / (1.0 + exp(clamp((0.5 * (h0 + h1) - uFog.y) / uFog.z, -30.0, 30.0))) : (fogAbove(h0) - fogAbove(h1)) / dh;
+  return uFog.x * max(mean, 0.0) * dist;
+}
+
+// Thin fog lies in banks that drift with the wind at the ground: its density
+// around a position (meters from the eye: right, ahead), relative to the mean.
+float fogBank(float2 at) {
+  float2 q = (at - SURF * uStrip.w) * 0.0006;
+  return 0.15 + 1.7 * smoothstep(0.25, 0.75, tNoise.SampleLevel(sWrap, float3(q.x, 0.37, q.y), 0.0).r);
+}
+
+// Optical depth of the fog along the view ray v from the eye over dist to the
+// height h1, banks included. The banks are read at four places along the part of
+// the path that the eye sees into, each counted by the density of the layer at
+// its height.
+float fogAlong(float3 v, float dist, float h1) {
+  float h0 = uGround.w;
+  float tau = fogDepth(dist, h0, h1);
+  if (uFog.w <= 0.001 || tau <= 1e-4) return tau;
+  float reach = min(1.0, 2.5 / tau);
+  float weight = 1e-5, sum = 1e-5;
+  for (int i = 0; i < 4; i++) {
+    float f = (float(i) + 0.5) * 0.25 * reach;
+    float w = 1.0 / (1.0 + exp(clamp((lerp(h0, h1, f) - uFog.y) / uFog.z, -30.0, 30.0)));
+    weight += w;
+    sum += w * fogBank(v.xz * (f * dist));
+  }
+  return tau * lerp(1.0, sum / weight, uFog.w);
+}
+
+// The same along a view ray into the sky: up to where the ray leaves the layer.
+// The Earth curves away below the ray, so even a level ray leaves it eventually.
+float fogSky(float3 v) {
+  float clear = uFog.y + 6.0 * uFog.z, h0 = uGround.w;
+  if (h0 >= clear) return 0.0;
+  float t = min(R_EFF * (-v.y + sqrt(v.y * v.y + 2.0 * (clear - h0) / R_EFF)), 4e5);
+  return fogAlong(v, t, clear);
+}
+
+// What the fog above a point at height h lets through of the direct light.
+float fogSun(float h) {
+  if (uFog.x <= 0.0) return 1.0;
+  return exp(-uFog.x * fogAbove(h) / max(sin(uLand.x), 0.06));
+}
+
+float landOpen(float2 p);
+
+// The light that fog scatters toward the viewer in view direction v: its own
+// brightness, and around the light source a glare, because fog scatters most of
+// the light forward. open: how much of the light source the clouds let through.
+// Behind land the source glares far less; a remainder comes over the ridge.
+float3 fogLight(float3 v, float open) {
+  float c = dot(v, uSunDir);
+  float glare = uFogCol.w * open * (0.25 + 0.75 * landOpen(uSun));
+  // Fog is never even: wisps drift through it with the wind, and upward, where
+  // the layer thins and its light comes from, it is brighter.
+  float2 q = (v.xz * (260.0 / (abs(v.y) + 0.2)) - SURF * uStrip.w) * 0.0012;
+  float wisp = tNoise.SampleLevel(sWrap, float3(q.x, 0.61, q.y), 0.0).r;
+  float3 own = uFogCol.rgb * ((0.80 + 0.40 * wisp) * lerp(0.80, 1.12, saturate(0.5 + 2.5 * v.y)));
+  // A city behind the fog lights it from within: the light of its lamps is not
+  // lost, it arrives as a warm band low over the horizon.
+  if (uLand.w > 0.5) own += float3(1.0, 0.68, 0.38) * (uStrip.z * 0.55 * exp(-pow(abs(v.y - 0.035) / 0.06, 1.5)));
+  return (own + uSunLand * (glare * (hg(c, 0.82) + 0.3 * hg(c, 0.4)))) * uExposure;
 }
 
 float3 octDecode(float2 f) {
@@ -119,11 +198,22 @@ float4 land(float2 p, float3 v, float3 haze, out float dist) {
   if (a.a < 0.002) return 0.0;
   float4 b = tLandB.SampleLevel(sClamp, uv, lod);
   float4 c = tLandC.SampleLevel(sClamp, uv, lod);
-  // Wet land is darker.
-  a.rgb *= 1.0 - 0.22 * uStorm.z;
+  // Wet land is darker; snowfall does not wet it.
+  a.rgb *= 1.0 - 0.22 * uStorm.z * (1.0 - uSnow.x);
   float3 m = octDecode(b.xy);
   float3 n = float3(m.x, m.z, m.y);   // stored with the vertical as the axis
   dist = DIST_MIN * pow(DIST_MAX / DIST_MIN, b.z);
+  float flat0 = dist * length(v.xz);
+  float h1 = uGround.w + v.y * dist + flat0 * flat0 / (2.0 * R_EFF);
+  landHeight = h1;
+
+  // Snow. In the mountains it lies above the snow line on everything that is not
+  // too steep; the line is ragged, and rock faces stay bare. In a city it lies on
+  // roofs and open ground when it lies at the viewer's level at all.
+  float ragged = tNoise.SampleLevel(sWrap, float3(v.x * dist * 0.0009, 0.21, v.z * dist * 0.0009), 0.0).r - 0.5;
+  float lies = uLand.w > 0.5 ? uSnow.z * smoothstep(0.55, 0.85, n.y)
+                             : smoothstep(-140.0, 160.0, h1 - uSnow.y + 420.0 * ragged) * smoothstep(0.30, 0.62, n.y + 0.25 * ragged);
+  a.rgb = lerp(a.rgb, float3(0.86, 0.89, 0.94), lies);
 
   // Shadow: if the light source is lower than the horizon that the terrain leaves
   // in its direction from this point, the point is in shadow.
@@ -139,10 +229,14 @@ float4 land(float2 p, float3 v, float3 haze, out float dist) {
   float open = sunOpen;
   float steep = smoothstep(0.05, 0.16, l.y);
   if (steep > 0.0 && shadow > 0.0) open = lerp(open, cloudShade(v * dist, l), steep);
+  // Fog above the point takes the direct light and returns part of it from all
+  // sides.
+  float clear = fogSun(h1);
   // In addition to the direct light and that of the sky there is the light
   // reflected by the sunlit landscape all around: it also brightens what lies in
   // shadow.
-  float3 lit = a.rgb * (uSunLand * (saturate(dot(n, l)) * shadow * open + 0.055 * saturate(sin(uLand.x)) * (0.5 * open + 0.5 * sunOpen)) + uSkyLand * b.a);
+  float3 lit = a.rgb * (uSunLand * (saturate(dot(n, l)) * shadow * open * clear + 0.055 * saturate(sin(uLand.x)) * (0.5 * open + 0.5 * sunOpen)
+                                    + 0.22 * saturate(sin(uLand.x)) * sunOpen * (1.0 - clear)) + uSkyLand * b.a);
   // Lightning lights up the land around it.
   if (uFlash.w > 0.001) {
     float3 toFlash = uFlash.xyz - v * dist;
@@ -160,8 +254,6 @@ float4 land(float2 p, float3 v, float3 haze, out float dist) {
     lit += lamps;
   }
 
-  float flat0 = dist * length(v.xz);
-  float h1 = uGround.w + v.y * dist + flat0 * flat0 / (2.0 * R_EFF);
   float3 through = airThrough(dist, uGround.w, h1);
   // The haze in front of distant land is paler than the sky above it: light from
   // all directions mixes in it.
@@ -363,7 +455,7 @@ float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
   float gust = tNoise.SampleLevel(sWrap, float3((lee.x - uStrip.w) * 0.0006, lee.y * 0.0017, uTime * (14.0 / 3600.0)), 0.0).r;
   float wind = lerp(2.4 * smoothstep(0.62, 0.9, gust), 0.45 + 1.1 * gust, saturate(uWind.y / 5.0));
   // Rain roughens the water at small scale: drops make rings.
-  rough = rough * wind + calm + 0.010 * uStorm.z;
+  rough = rough * wind + calm + 0.010 * uStorm.z * (1.0 - uSnow.x);
   slope = slope * sqrt(wind) + swell;
 
   // Whitecaps, more in the gusts. Far out a pixel covers many cells: there its
@@ -499,7 +591,7 @@ float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
   // source is missing. If the source is low, the path of the light through the
   // clouds is too long to trace position by position: then, as with the land, what
   // counts is whether it is behind clouds as seen from the viewer.
-  float direct = lerp(sunOpen, tShade.SampleLevel(sClamp, p / uView, 0.0).r, smoothstep(0.05, 0.16, groundLight().y));
+  float direct = lerp(sunOpen, tShade.SampleLevel(sClamp, p / uView, 0.0).r, smoothstep(0.05, 0.16, groundLight().y)) * fogSun(uGround.w - eye);
   // The light that returns from the depth.
   col += (1.0 - fres) * uSea.rgb * (uSkyLand + uSunLand * (0.35 * saturate(sin(uLand.x)) * direct)) * uExposure;
   // The glitter path of the light source: only where its light reaches the water.
@@ -571,9 +663,10 @@ float sunThrough() {
 // rain: coverage of the rain, its mean distance and its spread in km, col: the
 // sky with clouds. near: the fraction of the rain that lies in front of the
 // ground. bolt: the light of a lightning channel at distance boltFar; ground in
-// front of it occludes it.
+// front of it occludes it. fogTau arrives as the optical depth of the fog along
+// the ray into the sky; where there is ground it becomes that up to the ground.
 void ground(float2 p, float3 v, float2 uv, float3 sky, float4 cloud, float2 cloudZ, float3 rain, float boltFar, inout float3 col, inout float alpha,
-            inout float near, inout float3 bolt) {
+            inout float near, inout float3 bolt, inout float fogTau) {
   landLights = 0.0;
   if (uGround.x + uGround.y < 0.5) return;
   // State of the clouds now: for their shadow on the land.
@@ -596,6 +689,7 @@ void ground(float2 p, float3 v, float2 uv, float3 sky, float4 cloud, float2 clou
     col = lerp(col, w, cover);
     sky = lerp(sky, w, cover);
     alpha *= 1.0 - cover;
+    if (uFog.x > 0.0 && cover > 0.0) fogTau = lerp(fogTau, fogAlong(v, far, uGround.w - uGround.z), cover);
   }
   if (uGround.x > 0.5) {
     float dist;
@@ -607,6 +701,7 @@ void ground(float2 p, float3 v, float2 uv, float3 sky, float4 cloud, float2 clou
       near = lerp(near, rainBefore(rain, dist), g.a);
       bolt *= 1.0 - g.a * step(dist, boltFar);
       alpha *= 1.0 - g.a;
+      if (uFog.x > 0.0) fogTau = lerp(fogTau, fogAlong(v, dist, landHeight), g.a);
     }
   }
 }

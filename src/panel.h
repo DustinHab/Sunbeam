@@ -16,7 +16,9 @@ struct PanelHost {
   double* latitude = nullptr;
   double* longitude = nullptr;
   float* lapseMinutes = nullptr;
-  bool* realWeather = nullptr;       // live weather: the weather at the place then sets clouds and wind
+  bool* realWeather = nullptr;       // live weather: the weather at the place then sets clouds, wind, fog and temperature
+  float* fog = nullptr;              // the slider Fog as set by hand, 0 to 1
+  float* temperature = nullptr;      // the slider Temperature as set by hand, degrees Celsius; below -50: by the season
   const Renderer* render = nullptr;
   HICON icon = nullptr;
   std::function<double()> shownTime;         // the time the sky currently shows, seconds since 1970
