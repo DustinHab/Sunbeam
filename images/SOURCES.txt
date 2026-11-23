@@ -1,0 +1,10 @@
+moon.jpg
+  Map of the lunar surface from images of the Lunar Reconnaissance Orbiter
+  (LROC WAC), from the CGI Moon Kit: https://svs.gsfc.nasa.gov/4720
+  Credit: NASA's Scientific Visualization Studio. Public domain (work of NASA).
+
+moon_relief.bin
+  Slope of the lunar surface (rise to the east and to the north, 720 x 360,
+  two bytes per point), computed from the elevation data ldem_4_uint.tif of
+  the Lunar Orbiter Laser Altimeter in the same CGI Moon Kit.
+  Credit: NASA's Scientific Visualization Studio. Public domain (work of NASA).

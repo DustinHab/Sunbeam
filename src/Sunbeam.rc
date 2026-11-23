@@ -1,0 +1,17 @@
+// Cloud textures, see clouds\LICENSE-three-geospatial.txt
+CLOUD_SHAPE RCDATA "clouds\\shape.bin"
+CLOUD_DETAIL RCDATA "clouds\\shape_detail.bin"
+WEATHER_MAP RCDATA "clouds\\local_weather.png"
+TURBULENCE RCDATA "clouds\\turbulence.png"
+// NASA moon map, see images\SOURCES.txt
+MOON_MAP RCDATA "images\\moon.jpg"
+MOON_RELIEF RCDATA "images\\moon_relief.bin"
+// Ground: mountain panorama from swisstopo data, see ground\SOURCES.txt
+MOUNTAINS_A RCDATA "ground\\mountains_a.png"
+MOUNTAINS_B RCDATA "ground\\mountains_b.png"
+MOUNTAINS_C RCDATA "ground\\mountains_c.png"
+// Ground: Chicago skyline from the USGS laser scan, see ground\SOURCES.txt
+CITY_A RCDATA "ground\\city_a.png"
+CITY_B RCDATA "ground\\city_b.png"
+CITY_C RCDATA "ground\\city_c.png"
+CITY_D RCDATA "ground\\city_d.png"

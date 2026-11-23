@@ -1,0 +1,14 @@
+{
+  "out": "city",
+  "city": true,
+  "elevation": "data/chicago/mesh_height.npy",
+  "ground": "data/chicago/mesh_ground.npy",
+  "buildings": "data/chicago/mesh_buildings.npy",
+  "buildings_info": "data/chicago/mesh_buildings.json",
+  "east": 7458.8,
+  "north": 3783.8,
+  "eye_height": 186.0,
+  "heading": 270,
+  "near": 1500,
+  "far": 9600
+}

@@ -1,0 +1,15 @@
+{
+  "out": "mountains",
+  "elevation": "data/swisstopo/alti2.npy",
+  "image": "data/swisstopo/image2.npy",
+  "elevation_fine": "data/swisstopo/surface05.npy",
+  "image_fine": "data/swisstopo/image05.npy",
+  "fine_reach": 13000,
+  "fine_blend": 2000,
+  "east": 2616365,
+  "north": 1166139,
+  "above_ground": 3,
+  "heading": 132,
+  "near": 150,
+  "far": 49000
+}

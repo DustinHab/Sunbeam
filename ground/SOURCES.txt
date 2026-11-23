@@ -1,0 +1,30 @@
+Ground
+
+The images in this folder are computed in advance from terrain data with the
+scripts in tools\ground. One strip around the horizon per ground:
+a  colour of the surface and coverage
+b  direction of the surface, distance and open sky
+c  height of the horizon towards the light source
+d  lights at night and glass
+The program lights the strip itself, for any time of day.
+
+Mountains (mountains_a.png, mountains_b.png, mountains_c.png)
+  View from the Niesen in the Bernese Oberland to the south-east, towards
+  Jungfrau, Gspaltenhorn and Blüemlisalp.
+  Elevation model swissALTI3D (2 m), surface model swissSURFACE3D Raster
+  (0.5 m, up to 13 km), aerial image SWISSIMAGE (0.1 m and 2 m).
+  Source: Federal Office of Topography swisstopo, data.geo.admin.ch.
+  Free to use with a reference to the source.
+
+Skyline (city_a.png, city_b.png, city_c.png, city_d.png)
+  Chicago from Lake Michigan, 4.5 km off the shore.
+  Lidar scan of the U.S. Geological Survey, 3D Elevation Program, Cook County
+  2017 (USGS_LPC_IL_4County_Cook_2017_LAS_2019). Public domain.
+  Credit: U.S. Geological Survey.
+  Building outlines, names and the heights of towers built since then:
+  (c) OpenStreetMap contributors, Open Database License,
+  https://www.openstreetmap.org/copyright
+  Facades and lights are generated, not photographed.
+
+Sea
+  No strip: water to the horizon.
