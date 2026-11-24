@@ -145,7 +145,7 @@ measurements:
 | `Sunbeam.exe --weather <folder> [place]` | Looks a place up, fetches its weather once and writes down the resulting slider positions. |
 | `Sunbeam.exe --scene <file>` | Lists window classes and positions on the desktop (no titles). |
 | `Sunbeam.exe --drag <folder> [x y]` | Measures what a frame costs at rest and while a window is dragged, part by part, and compares the scattered light with the direct march through the haze (difference images). `quick.txt` in the folder: timings only; `compare.txt`: comparison only. |
-| `Sunbeam.exe --pace <folder> [x y]` | Simulates a pointer and a window that follows it, makes a frame for every display refresh and writes down how far the light was from the window when the frame appeared. |
+| `Sunbeam.exe --pace <folder> [x y]` | Simulates a pointer and a window that follows it, makes a frame for every display refresh and writes down how far the light was from the window when the frame appeared, and the shadow of the pointer from the pointer. |
 | `Sunbeam.exe --probe <folder> [seconds] [blind]` | Runs the real loop on the desktop for a few seconds without a tray icon and logs. With `blind` nothing appears on the screen. |
 
 The formats of the input files are described at the functions in

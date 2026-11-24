@@ -93,6 +93,7 @@ class Motion {
     bool led = false;        // computed ahead from the pointer; otherwise as last read
     bool moving = false;     // it is moving right now
     POINT pointer{};         // where the pointer will be
+    double px = 0, py = 0;   // the same, to fractions of a pixel
     bool held = false;       // the primary button is held
     bool stirred = false;    // the pointer has moved in the last moments
     float speed = 0;         // of the pointer, pixels per second
@@ -103,6 +104,11 @@ class Motion {
   // Where the frame of the followed window was at that time; false if it is not
   // known.
   bool frameAt(double time, HWND window, RECT& frame);
+  // Where the pointer was at that time, as read; false if it is not known.
+  bool pointerWas(double time, POINT& at);
+  // Seconds between two reports of the mouse if it reports seldom and evenly;
+  // otherwise 0.
+  double reports();
 
   // How the window currently follows the pointer, for the log.
   struct Model {
@@ -125,10 +131,21 @@ class Motion {
     HWND w = nullptr;
     RECT f{};
   };
+  // The path of the pointer over the last moments: a parabola through its
+  // readings.
+  struct Path {
+    double t0 = 0;                 // times count from here: the last reading
+    double x[3] = {}, y[3] = {};   // position there, speed, half the acceleration
+    // A mouse that reports seldom: seconds between two reports, and the time of
+    // one of them. every 0: it reports densely, or not evenly.
+    double every = 0, first = 0;
+  };
   void run();
   void fit(double t);
-  bool pointerAt(double t, double& x, double& y) const;
-  void speedNow(double& vx, double& vy) const;
+  bool pace(double& every, double& first) const;
+  Path path() const;
+  size_t firstAt(double t) const;
+  bool pointerAt(double t, double& x, double& y, const Path* ahead = nullptr) const;
 
   MotionSource* src_ = nullptr;
   bool ownSource_ = false;

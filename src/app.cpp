@@ -157,7 +157,7 @@ struct App {
   HCURSOR cursorHandle = nullptr;
   int cursorW = 0, cursorH = 0;   // area of the shape including the free margin, device pixels
   POINT cursorHot{}, cursorAt{};
-  POINT cursorShown{};            // where the image has it: ahead of cursorAt while it moves
+  double cursorShownX = 0, cursorShownY = 0;   // where the image has it: ahead of cursorAt while it moves
   bool cursorOn = false;
   double cursorSeen = 0;
   float cursorCalm = 1;           // 1 at rest, 0 during fast movement
@@ -980,8 +980,8 @@ bool readPointerShape(HCURSOR cursor, std::vector<uint8_t>& cover, int& w, int& 
 // Reports shape and position of the mouse pointer to the renderer. Returns
 // whether anything has changed and a new frame is due.
 // ahead: where the pointer will be when the frame appears; the image is made
-// for that position.
-bool trackPointer(double t, const POINT* ahead = nullptr) {
+// for that position, to a fraction of a pixel.
+bool trackPointer(double t, const Motion::Guess* ahead = nullptr) {
   CURSORINFO ci = {sizeof(ci)};
   bool on = app->par.pointer > 0 && GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor;
   bool changed = false;
@@ -1012,9 +1012,9 @@ bool trackPointer(double t, const POINT* ahead = nullptr) {
   POINT at = ci.ptScreenPos;
   // The image is made for where the pointer will be. Once it rests, that settles
   // on where it is, a few frames after its last movement.
-  POINT shown = ahead ? *ahead : at;
-  if (shown.x != app->cursorShown.x || shown.y != app->cursorShown.y) changed = true;
-  app->cursorShown = shown;
+  double shownX = ahead ? ahead->px : at.x, shownY = ahead ? ahead->py : at.y;
+  if (shownX != app->cursorShownX || shownY != app->cursorShownY) changed = true;
+  app->cursorShownX = shownX, app->cursorShownY = shownY;
   double dt = std::max(t - app->cursorSeen, 1e-3);
   if (!app->cursorOn || at.x != app->cursorAt.x || at.y != app->cursorAt.y) {
     // During fast movement the light visibly lags behind the pointer; the fringe
@@ -1033,8 +1033,8 @@ bool trackPointer(double t, const POINT* ahead = nullptr) {
   app->cursorOn = true;
   if (changed) {
     float s = app->mon.scale;
-    float x0 = (shown.x - app->mon.rect.left - app->cursorHot.x - POINTER_PAD) / s;
-    float y0 = (shown.y - app->mon.rect.top - app->cursorHot.y - POINTER_PAD) / s;
+    float x0 = float(shownX - app->mon.rect.left - app->cursorHot.x - POINTER_PAD) / s;
+    float y0 = float(shownY - app->mon.rect.top - app->cursorHot.y - POINTER_PAD) / s;
     app->render.setCursor(true, x0, y0, x0 + app->cursorW / s, y0 + app->cursorH / s, app->cursorCalm);
   }
   return changed;
@@ -1545,6 +1545,9 @@ struct Flight {
   HWND window = nullptr;
   RECT frame{};
   bool led = false;
+  bool stirred = false;   // the pointer was moving
+  double px = 0, py = 0;  // where the frame put it
+  double shown = 0;       // when the frame appears
 };
 
 // What a stretch of rushed frames amounted to, for the log.
@@ -1556,6 +1559,32 @@ struct Tally {
   double leadSum = 0;
   Motion::Model model;           // how the window followed the pointer
 };
+
+// How well the pointer was computed ahead, summed over the stretches in which
+// it moved.
+struct Pointed {
+  int frames = 0, pairs = 0;         // frames compared with what was read later, and pairs of consecutive ones
+  double off = 0, worst = 0;         // how far they were off, pixels: sum and largest
+  double jump = 0;                   // how much that changed from one frame to the next: sum
+  double at = 0, ex = 0, ey = 0;     // the frame compared last: when it appeared and how far it was off
+  int asked = 0, paced = 0;          // how often the pace of the mouse was asked for, and found
+  double every = 0;                  // that pace, seconds between two reports
+};
+
+void tell(Pointed& p) {
+  // A probe run tells of every stretch. Otherwise once there is half a minute of
+  // movement, and only the first times: the log stays small.
+  if (p.frames < (app->probe > 0 ? 30 : 3600)) return;
+  static int told = 0;
+  if (app->probe > 0 || told++ < 40) {
+    wchar_t pace[48] = L"densely";
+    if (2 * p.paced > p.asked) swprintf_s(pace, L"every %.1f ms", p.every * 1000);
+    logf(L"Pointer over %d frames: computed ahead off by %.1f px on average, at most %.0f px, changing by %.1f px from one frame to the next; "
+         L"the mouse reported %s",
+         p.frames, p.off / p.frames, p.worst, p.pairs ? p.jump / p.pairs : 0.0, pace);
+  }
+  p = Pointed();
+}
 
 void tell(const Tally& y, double t, const Beat& beat) {
   // A probe run also tells of the stretches in which only the pointer moved.
@@ -1593,6 +1622,7 @@ void run() {
   Flight flight;
   std::vector<Flight> owed;
   Tally tally;
+  Pointed pointed;
   while (!app->quit && !app->rebuild) {
     double t = now();
     if (app->probe > 0 && t - begin > app->probe) {
@@ -1625,6 +1655,7 @@ void run() {
         tally.began = t;
       } else {
         tell(tally, t, beat);
+        tell(pointed);
         // From here on the positions are read again.
         app->followed = nullptr;
         app->sceneEvent = true;
@@ -1651,7 +1682,7 @@ void run() {
         tally.frames++;
         tally.late += took < 0;
         tally.leadSum += lead.value;
-        if (flight.window) owed.push_back(flight);
+        if (flight.window || flight.stirred) owed.push_back(flight);
         flight.open = false;
       }
       // The next one starts as late as it can before the refresh it is for. If the
@@ -1668,14 +1699,31 @@ void run() {
       }
       if (app->quit || app->rebuild) break;
       ahead = app->motion.guess(latch, latch + beat.period);
-      // Earlier frames whose refresh has passed: where was the window really?
+      // Earlier frames that have appeared: where were window and pointer really?
       for (auto it = owed.begin(); it != owed.end();) {
-        if (t < it->latch + 0.002) {
+        if (t < it->shown + 0.002) {
           ++it;
           continue;
         }
+        POINT there;
+        if (it->stirred && app->motion.pointerWas(it->shown, there)) {
+          double ex = it->px - there.x, ey = it->py - there.y;
+          pointed.frames++;
+          pointed.off += std::hypot(ex, ey);
+          pointed.worst = std::max(pointed.worst, std::hypot(ex, ey));
+          if (it->shown - pointed.at < 1.5 * beat.period) {
+            pointed.jump += std::hypot(ex - pointed.ex, ey - pointed.ey);
+            pointed.pairs++;
+          }
+          pointed.at = it->shown, pointed.ex = ex, pointed.ey = ey;
+          if (pointed.frames % 16 == 1) {
+            double every = app->motion.reports();
+            pointed.asked++;
+            if (every > 0) pointed.paced++, pointed.every = every;
+          }
+        }
         RECT was;
-        if (app->motion.frameAt(it->latch, it->window, was)) {
+        if (it->window && app->motion.frameAt(it->latch, it->window, was)) {
           double off = std::max(std::max(std::abs(was.left - it->frame.left), std::abs(was.top - it->frame.top)),
                                 std::max(std::abs(was.right - it->frame.right), std::abs(was.bottom - it->frame.bottom)));
           tally.judged++;
@@ -1773,7 +1821,7 @@ void run() {
       if (found) app->render.setScene(scene, ahead.led ? LAG_LED : LAG_READ);
     }
     if (updateHeaven(t)) dirty = true;
-    if (trackPointer(t, rush ? &ahead.pointer : nullptr)) dirty = true;
+    if (trackPointer(t, rush ? &ahead : nullptr)) dirty = true;
     if (app->iconReady.exchange(false)) {
       std::lock_guard<std::mutex> hold(app->iconLock);
       app->render.setIconMask(app->iconMask.data(), app->mon.width(), app->mon.height());
@@ -1828,6 +1876,9 @@ void run() {
       flight.window = ahead.moving ? ahead.window : nullptr;
       flight.frame = ahead.frame;
       flight.led = ahead.led;
+      flight.stirred = ahead.stirred && app->cursorOn;
+      flight.px = ahead.px, flight.py = ahead.py;
+      flight.shown = latch + beat.period;
       // The positions of the other windows are re-read after the frame is on its
       // way, not before it.
       if (now() - lastScene > SCENE_EVERY) {
@@ -1866,7 +1917,10 @@ void run() {
       frames++;
     }
   }
-  if (rushing) tell(tally, now(), beat);
+  if (rushing) {
+    tell(tally, now(), beat);
+    tell(pointed);
+  }
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 }
 

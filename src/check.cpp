@@ -1048,10 +1048,17 @@ class Staged : public MotionSource {
     QueryPerformanceCounter(&c);
     return double(c.QuadPart) / freq_;
   }
-  POINT path(double t) const {
+  // How often the mouse reports its position, seconds.
+  double reports = 0.001;
+  void exact(double t, double& x, double& y) const {
     double s = t - start_;
-    return {LONG(std::lround(1900 + 1300 * std::sin(1.9 * s) + 250 * std::sin(5.3 * s + 1))),
-            LONG(std::lround(1000 + 500 * std::sin(1.3 * s + 0.5) + 120 * std::sin(4.1 * s)))};
+    x = 1900 + 1300 * std::sin(1.9 * s) + 250 * std::sin(5.3 * s + 1);
+    y = 1000 + 500 * std::sin(1.3 * s + 0.5) + 120 * std::sin(4.1 * s);
+  }
+  POINT path(double t) const {
+    double x, y;
+    exact(t, x, y);
+    return {LONG(std::lround(x)), LONG(std::lround(y))};
   }
   // The frame of the window at time t: the program applied the pointer position
   // of `delay` ago at the last of its steps.
@@ -1061,7 +1068,7 @@ class Staged : public MotionSource {
     return {c.x - 300, c.y - 20, c.x + 900, c.y + 700};
   }
   bool pointer(POINT& at, bool& held) override {
-    at = path(now());
+    at = path(std::floor(now() / reports) * reports);
     held = true;
     return true;
   }
@@ -1152,9 +1159,12 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
 
   // Delay, step, and for steps that hang on the refreshes how long after one they
   // come (otherwise negative).
-  const double programs[6][3] = {{0.001, 0.001, -1}, {0.003, 0.0045, -1}, {0.002, 0.0073, -1}, {0.010, 0.0137, -1}, {0.002, 0, 0.001}, {0.002, 0, 0.75}};
+  // The last number: seconds between two reports of the mouse.
+  const double programs[7][4] = {{0.001, 0.001, -1, 0.001}, {0.003, 0.0045, -1, 0.001}, {0.002, 0.0073, -1, 0.001}, {0.010, 0.0137, -1, 0.001},
+                                 {0.002, 0, 0.001, 0.001},  {0.002, 0, 0.75, 0.001},    {0.002, 0, 0.75, 0.008}};
   for (const auto& program : programs) {
     stage.delay = program[0], stage.step = program[1];
+    stage.reports = program[3];
     stage.base = beat.base, stage.period = beat.period;
     stage.phase = program[2] < 0 ? -1 : program[2] < 0.5 ? program[2] : program[2] * beat.period;
     if (stage.phase < 0) {
@@ -1162,6 +1172,7 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
     } else {
       fprintf(log, "A program that moves its window once per refresh, %.1f ms after it, %.0f ms behind the pointer\n", stage.phase * 1000, stage.delay * 1000);
     }
+    if (stage.reports > 0.0015) fprintf(log, "  (the mouse reports every %.0f ms)\n", stage.reports * 1000);
     Motion motion;
     motion.start(&stage);
     motion.enable(true);
@@ -1170,7 +1181,9 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
     // The new way.
     {
       Lead lead;
-      std::vector<double> ahead, read, spans;
+      std::vector<double> ahead, read, spans, pointerOff, pointerJump;
+      double wasX = 0, wasY = 0;
+      bool was = false;
       int frames = 0, late = 0, led = 0, overslept = 0;
       double leadSum = 0, last = stage.now();
       for (int i = 0; i < 1200; i++) {
@@ -1187,7 +1200,7 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
         RECT seen = stage.truth(t);
         scene[2] = occluder(g.window ? g.frame : seen);
         r.setScene(scene, g.led ? 0.002f : 0.007f);
-        r.setCursor(true, g.pointer.x / scale, g.pointer.y / scale, g.pointer.x / scale + 50, g.pointer.y / scale + 50, 1);
+        r.setCursor(true, float(g.px) / scale, float(g.py) / scale, float(g.px) / scale + 50, float(g.py) / scale + 50, 1);
         if (draw) {
           r.render(t - last, skyOut.rtv.Get(), lightOut.rtv.Get(), beat.period);
           r.submit();
@@ -1214,6 +1227,13 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
         leadSum += lead.value;
         // A frame that was not finished appears one refresh later.
         RECT shown = stage.truth(done ? latch : latch + beat.period);
+        // The pointer itself is drawn by the display where the mouse last reported
+        // it when the frame appears: one refresh after the frame is taken over.
+        POINT there = stage.path(std::floor((latch + beat.period) / stage.reports) * stage.reports);
+        double ex = g.px - there.x, ey = g.py - there.y;
+        pointerOff.push_back(std::hypot(ex, ey));
+        if (was) pointerJump.push_back(std::hypot(ex - wasX, ey - wasY));
+        wasX = ex, wasY = ey, was = true;
         ahead.push_back(off(g.window ? g.frame : seen, shown));
         read.push_back(off(seen, shown));
       }
@@ -1228,6 +1248,8 @@ int runPace(const std::wstring& dir, float sunX, float sunY) {
       }
       report("positions computed ahead:", ahead);
       report("positions as last read:", read);
+      report("pointer computed ahead:", pointerOff);
+      report("  its error from frame to frame:", pointerJump);
     }
     motion.stop();
 
