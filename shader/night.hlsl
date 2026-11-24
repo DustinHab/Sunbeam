@@ -107,7 +107,7 @@ struct Dot {
   float4 pos : SV_Position;
   float2 off : TEXCOORD0;                     // from its center, pixels
   nointerpolation float4 light : TEXCOORD1;   // rgb: its light at the center, a: width of its core in pixels
-  nointerpolation float2 glare : TEXCOORD2;   // the glow around a bright one: strength relative to the center, radius in pixels
+  nointerpolation float3 glare : TEXCOORD2;   // the glow around a bright one: strength relative to the center, radius in pixels; z: how far around the center it is drawn, pixels
 };
 
 static const float2 CORNER[6] = {
@@ -120,7 +120,7 @@ Dot hidden() {
   o.pos = float4(2.0, 2.0, 2.0, 1.0);
   o.off = 0.0;
   o.light = 0.0;
-  o.glare = float2(0.0, 1.0);
+  o.glare = float3(0.0, 1.0, 1.0);
   return o;
 }
 
@@ -133,8 +133,12 @@ Dot dotAt(float2 p, float b, float3 tint, uint corner) {
   float peak = min(b, PEAK);
   float glare = b > 0.5 ? 0.006 * pow(max(b, 0.5), 0.9) : 0.0;
   float reach = 2.2 * sigma + 1.5 * px;
-  float size = 3.3 * sigma + 1.0;
-  if (glare > 0.002) size = max(size, reach * sqrt(max(pow(glare / 0.002, 0.6667) - 1.0, 0.0)) + 1.0);
+  // The square it is drawn in. Core and glow run out to nothing before its edge
+  // (see Star): cut off, even at a thousandth of white, the edge of the square
+  // shows in a dark sky. It is large enough that only a glow below 0.0004 is
+  // taken down that way.
+  float size = 4.5 * sigma + 1.0;
+  if (glare > 0.0004) size = max(size, reach * sqrt(max(pow(glare / 0.0004, 0.6667) - 1.0, 0.0)) / 0.62 + 1.0);
   size = min(size, 96.0 * px);
   float2 c = CORNER[corner % 6u];
   float2 at = p * px + c * size;
@@ -142,7 +146,7 @@ Dot dotAt(float2 p, float b, float3 tint, uint corner) {
   o.pos = float4(at.x / uRes.x * 2.0 - 1.0, 1.0 - at.y / uRes.y * 2.0, 0.0, 1.0);
   o.off = c * size;
   o.light = float4(tint * peak, sigma);
-  o.glare = float2(glare / max(peak, 1e-4), reach);
+  o.glare = float3(glare / max(peak, 1e-4), reach, size);
   return o;
 }
 
@@ -198,7 +202,9 @@ float4 Star(Dot v) : SV_Target {
   float core = exp(-r2 / (2.0 * v.light.a * v.light.a));
   float wide = 1.0 + r2 / (v.glare.y * v.glare.y);
   float glare = v.glare.x / (wide * sqrt(wide));
-  return float4(v.light.rgb * (core + glare), 1.0);
+  // Round, and down to nothing before the edge of the square.
+  float within = 1.0 - smoothstep(0.62 * v.glare.z, 0.98 * v.glare.z, sqrt(r2));
+  return float4(v.light.rgb * ((core + glare) * within), 1.0);
 }
 
 // ---- Milky Way ----
@@ -340,7 +346,8 @@ float4 Trail(Streak v) : SV_Target {
   float q = clamp(dot(p - a, dir), 0.0, head);
   float2 gap = p - (a + dir * q);
   float age = v.par.x - q / pace;                // seconds since the head was there
-  float core = exp(-dot(gap, gap) / (2.0 * v.width.x * v.width.x));
+  // Down to nothing before the edge of what is drawn, as for the stars.
+  float core = exp(-dot(gap, gap) / (2.0 * v.width.x * v.width.x)) * (1.0 - smoothstep(0.7 * v.width.y, 0.97 * v.width.y, length(gap)));
   // Most of the trail goes out at once; of a bright one a faint rest lingers.
   float wake = exp(-age / v.par.z) + 0.015 * smoothstep(3.0, 8.0, v.par.w) * exp(-age / (7.0 * v.par.z));
   float light = burn(q / len, v.look.a) * wake * core;
