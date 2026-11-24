@@ -15,6 +15,14 @@ int runCheck(const std::wstring& dir, int viewW, int viewH, float scale);
 // showing anything. sunX, sunY: position of the sun as a fraction of the screen.
 int runReal(const std::wstring& dir, float sunX, float sunY);
 
+// Measures what a frame costs at rest and while a window is dragged, part by
+// part, and writes it to drag.txt.
+int runDrag(const std::wstring& dir, float sunX, float sunY);
+
+// Measures, with a simulated pointer and window, how far the light is from a
+// dragged window when the frame appears, and writes it to pace.txt.
+int runPace(const std::wstring& dir, float sunX, float sunY);
+
 // Renders the sky of an empty desktop for a series of times of day or sun
 // positions to files.
 int runSky(const std::wstring& dir, int viewW, int viewH, float scale);

@@ -55,6 +55,7 @@ cbuffer LightC : register(b0) {
   float4 uCursorPar;    // logical pixels per texel, stillness (0 during fast motion), strength
   float4 uMoonPar;      // 1: the light source is the moon; illuminated fraction, direction of the bright side, direction of the north pole
   float4 uGlow;         // x: peak brightness in the HDR image as a multiple of white, 1 = off; y: squash of the disc at the horizon; z: 1 = the light source is lightning; w: how far the wind has carried the dust, logical pixels
+  float4 uVol;          // the haze in front of the rearmost window: x its depth, y knots of the volume, z steps per knot interval, w steps through the shadows of windows
   float4 uRect[32];
   float4 uPar[32];      // depth, opacity, corner radius, kind
   float4 uAux[32];      // uncertainty of the area, ghost of a window that has disappeared
@@ -67,6 +68,8 @@ Texture2D tA : register(t2);       // depending on the step: previous scattered 
 Texture2D tBloom : register(t3);
 Texture3D tNoise : register(t4);
 Texture2D tCursor : register(t5);  // r = coverage of the mouse pointer including clear margin
+Texture3D tVol : register(t6);     // the haze in front of the rearmost window, summed from the viewer up to each knot
+Texture2D tFar : register(t7);     // the haze behind it, summed
 
 float2 uvOf(float2 q) {
   return q / uView;
@@ -226,6 +229,324 @@ float4 Scatter(float4 pos : SV_Position) : SV_Target {
   return lerp(prev, float4(acc, zEnd / uZMax, accFar, small), uAlpha);
 }
 
+// The same scattered light in three parts, so that a moving window costs little.
+//
+// A window shadows only haze in front of it, and no window lies deeper than
+// uVol.x. Everything the march above reads from textures (clouds and mountains,
+// icons, mist) is independent of the windows. It is therefore summed once
+// without them: the haze behind uVol.x per pixel (Far), the haze in front of it
+// from the viewer up to each of a row of knots (Volume). In front of uVol.x the
+// lookups are blurred by the size of the sun, the sums there are smooth and a
+// coarse grid holds them. Resolve then only walks through the depths where the
+// path to the sun crosses a window and removes what the window shadows.
+
+// The haze at depth z: x = the light it scatters toward the viewer, y = the same
+// in the shadow of the icons, z = how strongly an icon shadows it.
+float3 hazeAt(float2 p, float2 toSun, float z, float phase, float cosT) {
+  float fv = farVis(p, toSun, z);
+  if (fv < 0.002) return 0.0;
+  float n = tNoise.SampleLevel(sWrap, float3(p, z) * uMistScale + uMistOff, 0.0).a;
+  float dens = exp(uMist * 7.0 * (n - 0.5));
+  float trans = exp(-uSigma * (z + (uZMax - z) / cosT));
+  float e = fv * dens * phase * trans * smoothstep(0.0, uNear, z / uZMax);
+  float iv = iconVis(p, toSun, z);
+  return float3(e, e * iv, (1.0 - iv) * (z / uZMax) * fv);
+}
+
+RWTexture3D<float4> oVol : register(u0);
+
+// The haze from the viewer to uVol.x: r = its light up to each knot, g = the same
+// in the shadow of the icons, b = the strongest icon shadow up to there.
+[numthreads(8, 8, 1)]
+void Volume(uint3 id : SV_DispatchThreadID) {
+  uint w, h, knots;
+  oVol.GetDimensions(w, h, knots);
+  if (id.x >= w || id.y >= h) return;
+  float2 p = (float2(id.xy) + 0.5) / float2(w, h) * uView;
+  float2 toSun = uSun - p;
+  float cosT = uZS / length(float3(toSun, uZS));
+  float phase = phaseFn(cosT);
+  int sub = max(int(uVol.z), 1);
+  float slab = uVol.x / float(knots - 1u), dz = slab / float(sub);
+  float3 sum = 0.0;
+  oVol[uint3(id.xy, 0u)] = 0.0;
+  [loop] for (uint k = 1u; k < knots; k++) {
+    [loop] for (int s = 0; s < sub; s++) {
+      float3 e = hazeAt(p, toSun, (float(k - 1u) + (float(s) + 0.5) / float(sub)) * slab, phase, cosT);
+      sum.xy += e.xy;
+      sum.z = max(sum.z, e.z);
+    }
+    oVol[uint3(id.xy, k)] = float4(sum.xy * (uSigma * dz), sum.z, 0.0);
+  }
+}
+
+// The haze from uVol.x to the rearmost plane: no window shadows it. The same
+// content, per pixel. Here the lookups are sharp: steps offset per pixel and per
+// frame, averaged over the frames by the blend factor.
+float4 Far(float4 pos : SV_Position) : SV_Target {
+  float2 p = pos.xy / uRes * uView;
+  float2 toSun = uSun - p;
+  float cosT = uZS / length(float3(toSun, uZS));
+  float phase = phaseFn(cosT);
+  float span = uZMax - uVol.x;
+  int n = max(int(round(float(uSteps) * span / uZMax)), 1);
+  float dz = span / float(n);
+  float j = frac(ign(pos.xy) + uJitter);
+  float3 sum = 0.0;
+  [loop] for (int k = 0; k < n; k++) {
+    float3 e = hazeAt(p, toSun, uVol.x + (float(k) + j) * dz, phase, cosT);
+    sum.xy += e.xy;
+    sum.z = max(sum.z, e.z);
+  }
+  return float4(sum.xy * (uSigma * dz), sum.z, 1.0);
+}
+
+float3 volAt(float2 uv, float z) {
+  return tVol.SampleLevel(sClamp, float3(uv, (z / uVol.x * (uVol.y - 1.0) + 0.5) / uVol.y), 0.0).rgb;
+}
+
+// How much of the sun plate i covers for the haze at depth z in front of it.
+float plateCover(int i, float2 p, float2 toSun, float z) {
+  float4 par = uPar[i];
+  float t = 1.0 - z / par.x;
+  float wd = max(0.75, uSunR * t);
+  return 1.0 - smoothstep(-wd, wd, sdRound(p + toSun * t, uRect[i], par.z));
+}
+
+// The fraction of the sunlight that reaches the haze at depth z past the plates
+// in mask, leaving out plate skip.
+float lightPast(uint mask, int skip, float2 p, float2 toSun, float z) {
+  float vis = 1.0;
+  [loop] for (int w = 0; w < uN; w++) {
+    if (uPar[w].x < z) break;
+    if (w != skip && (mask & (1u << uint(w))) != 0u) vis *= 1.0 - uPar[w].y * plateCover(w, p, toSun, z);
+  }
+  return vis;
+}
+
+// Where the segment p .. p + d crosses the rectangle r, widened by grow: the
+// part of it inside, as fractions of the segment. Empty if y is less than x.
+float2 crossing(float2 p, float2 inv, float4 r, float grow) {
+  float2 t0 = (r.xy - grow - p) * inv, t1 = (r.zw + grow - p) * inv;
+  float2 l = min(t0, t1), h = max(t0, t1);
+  return float2(max(max(l.x, l.y), 0.0), min(min(h.x, h.y), 1.0));
+}
+
+// The light of the haze that is seen up to depth z: its sums there, less what
+// the translucent plates in front (at tz, letting tf through) hold back; tb is
+// what each of them has cut off.
+float seenTo(float2 uv, float z, float4 tz, float4 tf, float4 tb) {
+  float4 past = step(tz, z), damp = lerp(1.0, tf, past);
+  return damp.x * damp.y * damp.z * damp.w * volAt(uv, z).y + dot(past, tb);
+}
+
+// Scattered light from the sums: the same four values as Scatter.
+//
+// What the windows shadow is not found by walking through the depth. With B(z)
+// the light of the haze up to depth z and C(z) the fraction the windows shadow
+// there, the shadowed light is the sum of C times the growth of B, and that
+// equals C times B at the end minus the sum of B times the growth of C. C only
+// changes where the path to the sun crosses the edge of a window: along that
+// path the cover of a window rises once and falls once. Each rise and fall is
+// located, and the light seen up to there is read off exactly where the cover
+// changes: next to it the shadow of another window may already begin.
+float4 Resolve(float4 pos : SV_Position) : SV_Target {
+  float2 p = pos.xy / uRes * uView;
+  float2 uv = pos.xy / uRes;
+  float2 toSun = uSun - p;
+
+  // The plates from the nearest to the farthest. The view ray ends at the
+  // frontmost opaque one at this position; translucent ones in front of it
+  // attenuate the view (at most four). And the plates whose shadow can reach the
+  // path to the sun at all.
+  float zEnd = uZMax;
+  float4 tz = 1e9, tf = 1.0;
+  int nt = 0, i;
+  uint mask = 0u;
+  float m = uSunR + 1.0;
+  float2 inv = 1.0 / float2(abs(toSun.x) < 1e-4 ? 1e-4 : toSun.x, abs(toSun.y) < 1e-4 ? 1e-4 : toSun.y);
+  [loop] for (i = uN - 1; i >= 0; i--) {
+    float4 par = uPar[i];
+    if (par.y <= 0.001) continue;
+    float2 ab = crossing(p, inv, uRect[i], m);
+    if (ab.y >= ab.x) mask |= 1u << uint(i);
+    if (zEnd < uZMax || ab.x > 0.0) continue;
+    float sd = sdRound(p, uRect[i], par.z);
+    if (par.y > 0.999) {
+      if (sd < 0.0) zEnd = par.x;
+    } else {
+      float c = 1.0 - smoothstep(-0.75, 0.75, sd);
+      if (c > 0.0) {
+        float f = 1.0 - par.y * c;
+        if (nt == 0) { tz.x = par.x; tf.x = f; }
+        else if (nt == 1) { tz.y = par.x; tf.y = f; }
+        else if (nt == 2) { tz.z = par.x; tf.z = f; }
+        else if (nt == 3) { tz.w = par.x; tf.w = f; }
+        nt++;
+      }
+    }
+  }
+  float zc = min(zEnd, uVol.x);
+
+  // Without shadows of windows: the sums up to the end, piece by piece between
+  // the translucent plates.
+  float see = 1.0;
+  float3 last = 0.0;
+  float2 sum = 0.0;
+  float small = 0.0;
+  float4 tb = 0.0;
+  [loop] for (i = 0; i < min(nt, 4); i++) {
+    float z = tz[i];
+    if (z >= zc) break;
+    float3 v = volAt(uv, z);
+    sum += see * (v.xy - last.xy);
+    small = max(small, see * v.z);
+    last = v;
+    float cut = see * (1.0 - tf[i]) * v.y;
+    if (i == 0) tb.x = cut;
+    else if (i == 1) tb.y = cut;
+    else if (i == 2) tb.z = cut;
+    else tb.w = cut;
+    see *= tf[i];
+  }
+  float3 vEnd = volAt(uv, zc);
+  sum += see * (vEnd.xy - last.xy);
+  small = max(small, see * vEnd.z);
+  float lit = sum.y;
+
+  if (mask != 0u) {
+    float gone = 0.0;
+    // Finer than half the distance between two knots the sums hold nothing.
+    float fine = 0.5 * uVol.x / (uVol.y - 1.0);
+    [loop] for (i = 0; i < uN; i++) {
+      if ((mask & (1u << uint(i))) == 0u) continue;
+      float4 par = uPar[i], rc = uRect[i];
+      float zl = min(par.x, zc);
+      // The penumbra widens toward the sun. Where the path leaves the plate on that
+      // side it is at most this wide.
+      float wide = max(0.75, uSunR * crossing(p, inv, rc, m).y);
+      float2 outer = crossing(p, inv, rc, wide);
+      if (outer.y < outer.x || par.x * (1.0 - outer.y) >= zl) continue;
+      // Inside the plate narrowed by the penumbra (and by its rounded corners) it
+      // covers the sun fully.
+      float2 size = 0.5 * (rc.zw - rc.xy);
+      float least = min(size.x, size.y), corner = min(par.z, least);
+      float2 core = least > max(wide, corner) ? crossing(p, inv, rc, -max(wide, corner)) : float2(1.0, 0.0);
+      // The two stretches of the path on which the cover changes, as fractions of
+      // the path: rise toward the sun (xy), fall toward the plate (zw).
+      float4 edge;
+      if (core.y > core.x) {
+        // Where the path enters the plate the penumbra is narrower: no wider than at
+        // the start of the core.
+        float thin = max(0.75, uSunR * core.x);
+        edge = float4(core.y, outer.y, crossing(p, inv, rc, thin).x, crossing(p, inv, rc, -max(thin, corner)).x);
+      } else {
+        // The path merely grazes the plate: the cover is highest where the distance
+        // to the plate, measured in widths of the penumbra, is smallest. Along a
+        // straight path that measure falls and then rises.
+        float a = outer.x, b = outer.y;
+        float x1 = b - 0.618034 * (b - a), x2 = a + 0.618034 * (b - a);
+        float f1 = sdRound(p + toSun * x1, rc, par.z) / max(0.75, uSunR * x1);
+        float f2 = sdRound(p + toSun * x2, rc, par.z) / max(0.75, uSunR * x2);
+        for (int g = 0; g < 6; g++) {
+          if (f1 < f2) {
+            b = x2, x2 = x1, f2 = f1;
+            x1 = b - 0.618034 * (b - a);
+            f1 = sdRound(p + toSun * x1, rc, par.z) / max(0.75, uSunR * x1);
+          } else {
+            a = x1, x1 = x2, f1 = f2;
+            x2 = a + 0.618034 * (b - a);
+            f2 = sdRound(p + toSun * x2, rc, par.z) / max(0.75, uSunR * x2);
+          }
+        }
+        if (min(f1, f2) >= 1.0) continue;
+        float top = 0.5 * (a + b);
+        edge = float4(top, outer.y, outer.x, top);
+      }
+      float took = 0.0;
+      [loop] for (int e = 0; e < 2; e++) {
+        float2 tt = e == 0 ? edge.xy : edge.zw;
+        float za = max(par.x * (1.0 - tt.y), 0.0), zb = min(par.x * (1.0 - tt.x), zl);
+        if (zb <= za) continue;
+        float ca = plateCover(i, p, toSun, za), cb = plateCover(i, p, toSun, zb);
+        if (ca == cb) continue;
+        // The stretch in pieces no longer than the sums are fine, at most eight. In
+        // each piece the light is read off at the depth where the cover has made half
+        // of its change there: a sharp edge is found wherever it lies in the piece, and
+        // a cover that creeps (a path along an edge of the plate) is followed piece by
+        // piece.
+        int n = clamp(int(ceil((zb - za) / fine)), 1, 8);
+        float dz = (zb - za) / float(n);
+        [loop] for (int k = 0; k < n; k++) {
+          float lo = za + float(k) * dz, hi = k + 1 < n ? lo + dz : zb;
+          float cn = k + 1 < n ? plateCover(i, p, toSun, hi) : cb;
+          if (cn != ca) {
+            // At the depth of another plate the light past the others and the light seen
+            // change at a stroke: that plate shadows nothing behind itself, and it
+            // attenuates the view from there on. A piece with such a depth inside is
+            // split there, so that each part is read off on its own side.
+            float cut = hi;
+            [loop] for (int w = 0; w < uN; w++) {
+              float zq = uPar[w].x;
+              if (uPar[w].y > 0.001 && zq > lo && zq < cut) cut = zq;
+            }
+            float cm = cut < hi ? plateCover(i, p, toSun, cut) : cn;
+            [loop] for (int part = 0; part < (cut < hi ? 2 : 1); part++) {
+              float a0 = part == 0 ? lo : cut, a1 = part == 0 ? cut : hi;
+              float c0 = part == 0 ? ca : cm, c1 = part == 0 ? cm : cn;
+              if (c1 == c0) continue;
+              float want = 0.5 * (c0 + c1);
+              // A stretch in one piece is located to a thirty-second of its length, a
+              // piece of a longer one to an eighth.
+              [loop] for (int h = 0; h < (n == 1 ? 5 : 3); h++) {
+                float zm = 0.5 * (a0 + a1);
+                if ((plateCover(i, p, toSun, zm) - want) * (c1 - c0) > 0.0) a1 = zm;
+                else a0 = zm;
+              }
+              float z = 0.5 * (a0 + a1);
+              took += (c1 - c0) * lightPast(mask, i, p, toSun, z) * seenTo(uv, z, tz, tf, tb);
+            }
+          }
+          ca = cn;
+        }
+      }
+      // Behind the plate its shadow ends at a stroke.
+      if (par.x < zc) {
+        float c0 = plateCover(i, p, toSun, par.x);
+        if (c0 > 0.0) took -= c0 * lightPast(mask, i, p, toSun, par.x) * seenTo(uv, par.x, tz, tf, tb);
+      }
+      gone -= par.y * took;
+    }
+    float open = lightPast(mask, -1, p, toSun, zc);
+    gone += (1.0 - open) * lit;
+    lit -= gone;
+
+    // The shadow of an icon counts where light arrives at the depth it is cast
+    // from: the depth at which the strongest one so far is reached.
+    if (small > 0.002) {
+      float za = 0.0, zb = zc, goal = 0.9 * vEnd.z;
+      for (int k = 0; k < 5; k++) {
+        float zm = 0.5 * (za + zb);
+        if (volAt(uv, zm).z >= goal) zb = zm;
+        else za = zm;
+      }
+      small *= lightPast(mask, -1, p, toSun, 0.5 * (za + zb));
+    }
+  }
+
+  // Behind the rearmost window, where no opaque plate ends the view.
+  if (zEnd > uVol.x) {
+    float3 far = tFar.Load(int3(pos.xy, 0)).rgb;
+    float all = tf.x * tf.y * tf.z * tf.w;
+    sum.x += all * far.r;
+    lit += all * far.g;
+    small = max(small, all * far.b);
+  }
+
+  float4 prev = tA.Load(int3(pos.xy, 0));
+  return lerp(prev, float4(max(lit, 0.0), zEnd / uZMax, sum.x, small), uAlpha);
+}
+
 static const float RIM_CAP = 1.6;
 // This much of the rim light goes into the glare: the soft glow around the
 // outline of a backlit window.
@@ -234,13 +555,8 @@ static const float HALO = 20.0;
 // Rim light at position p: when backlit, the outline of a window glows,
 // brightest where the sun is close behind the edge; the edge facing the sun also
 // catches grazing light. reach widens the band for coarse grids.
-float3 rimLight(float2 p, float reach) {
-  int top = -1;
-  float topSd = 1e9;
-  [loop] for (int i = 0; i < uN; i++) {
-    float sd = sdRound(p, uRect[i], uPar[i].z);
-    if (sd < reach && uAux[i].y < 0.5) { top = i; topSd = sd; }
-  }
+// top: the frontmost plate within reach of p, topSd: its distance.
+float3 rimOf(float2 p, float reach, int top, float topSd) {
   if (top < 0 || topSd <= -3.0 * reach || uRim <= 0.0) return 0.0;
   float band = smoothstep(-2.2 * reach, -0.5 * reach, topSd) * (1.0 - smoothstep(-0.3 * reach, 0.8 * reach, topSd));
   if (band <= 0.0) return 0.0;
@@ -259,6 +575,16 @@ float3 rimLight(float2 p, float reach) {
   float cosT = uZS / length(float3(toSun, uZS));
   float3 rim = uSunCol * (band * (0.45 + 0.55 * pow(facing, 0.7)) * v * phaseFn(cosT) * uRim * 0.8);
   return rim * (RIM_CAP / (RIM_CAP + luma(rim)));
+}
+
+float3 rimLight(float2 p, float reach) {
+  int top = -1;
+  float topSd = 1e9;
+  [loop] for (int i = 0; i < uN; i++) {
+    float sd = sdRound(p, uRect[i], uPar[i].z);
+    if (sd < reach && uAux[i].y < 0.5) { top = i; topSd = sd; }
+  }
+  return rimOf(p, reach, top, topSd);
 }
 
 // This much light the shadow of the mouse pointer removes from the haze close to
@@ -390,6 +716,9 @@ float4 Composite(float4 pos : SV_Position) : SV_Target {
   // off. The position of a window arrives up to one frame later than Windows draws
   // it; without this, light would appear beside the edge while dragging.
   float zEnd = uZMax, cover = 0.0, quiet = 1.0;
+  // And for the rim light: the frontmost plate whose edge is near.
+  int top = -1;
+  float topSd = 1e9;
   [loop] for (int i = 0; i < uN; i++) {
     float sd = sdRound(p, uRect[i], uPar[i].z);
     float4 aux = uAux[i], edge = uEdge[i], rc = uRect[i];
@@ -405,6 +734,7 @@ float4 Composite(float4 pos : SV_Position) : SV_Target {
     if (aux.y > 0.5) continue;
     if (uPar[i].y > 0.999 && sd < 0.0) zEnd = min(zEnd, uPar[i].x);
     cover = max(cover, 1.0 - smoothstep(-0.75, 0.75, sd));
+    if (sd < 1.0) { top = i; topSd = sd; }
   }
 
   // Upscaling that respects window edges (same depth preferred).
@@ -451,63 +781,71 @@ float4 Composite(float4 pos : SV_Position) : SV_Target {
   lit *= 1.0 - POINTER_SHADE * pointer;
   float3 col = tBloom.SampleLevel(sClamp, pos.xy / uRes, 0.0).rgb * uBloom;
   float icons = tIcons.SampleLevel(sClamp, uvOf(p), 0.0).r;
-  float3 sky = skyAt(p);
-
-  float3 rim = rimLight(p, 1.0) + pointerRim(p);
-
-  // Over windows and icons: the haze in front glows where the sun hits it.
-  // The limit applies to the light as it would be without the shadows of the
-  // windows; the fraction they let through thus stays an even gradient up to the
-  // shadow boundary, also close to the sun.
-  float3 full = uSunCol * (L.y * uExposure * uOverWin);
-  full *= OVER_CAP / (OVER_CAP + luma(full));
-  // The fraction acts on the final brightness: in the image the light thus falls
-  // off evenly toward the shadow boundary instead of dropping off only just before
-  // it.
-  float3 under = GROUND + full * keep;
-  float3 onWindow = (develop(GROUND + full) - develop(GROUND)) * keep + develop(under + col + rim) - develop(under);
-
-  // Where the sky is open, everything acts before the filmic curve: in the shadow
-  // of windows and icons the sky lacks light of the haze and gets darker, by the
-  // fraction the shadow removes, as far as the haze there matters against the sky
-  // at all. Where the sun hits the haze, light is added. This way it saturates
-  // softly instead of clipping hard to white.
-  float haze = luma(unshaded);
-  float dark = 0.85 * uShade * (1.0 - keep) * haze / (haze + 0.6 * luma(sky) + 1e-4);
-  dark = max(dark, POINTER_FLOOR * uShade * pointer);
-  float3 was = develop(sky);
-  // Close to the sun the haze scatters forward so strongly that it washed out the
-  // sky to white over a wide area: the sun appeared as a milky ball in the image.
-  // Its light therefore has an upper limit; far from the sun, where the rays lie,
-  // this changes nothing.
-  float3 veil = lit * uOverSky;
-  veil *= SKY_CAP / (SKY_CAP + luma(veil));
-  float3 want = develop(sky * (1.0 - dark) + veil + col + rim);
+  float3 rim = rimOf(p, 1.0, top, topSd) + pointerRim(p);
+  // known: here the sky lies open. Each of the two computations below only runs
+  // where it counts.
   float known = (1.0 - cover) * (1.0 - icons);
+  float3 added = 0.0;
+  float alpha = 0.0;
 
-  // HDR mode: there Windows blends linearly, and it accepts color without coverage
-  // only from a swap chain in HDR format (measured; from one with 8 bit it is
-  // dropped entirely). The light is therefore added linearly, at the brightness
-  // that white has in the HDR image.
-  if (uLinear > 0.5) {
-    float3 wasL = toLinear(was), wantL = toLinear(want);
-    // An HDR display can go brighter than white. What glares in the image (the sun
-    // disc, its innermost aureole, backlit cloud edges) really gets this brightness
-    // instead of ending at white.
-    float hot = smoothstep(2.5, 22.0, luma(sky * (1.0 - dark) + veil + col + rim));
-    wantL *= 1.0 + (max(uGlow.x, 1.0) - 1.0) * hot;
-    float3 fallL = (wasL - wantL) / max(wasL, 1e-5);
-    float alphaL = saturate(max(fallL.r, max(fallL.g, fallL.b)));
-    float3 onSkyL = max(wantL - wasL * (1.0 - alphaL), 0.0);
+  if (known < 0.999) {
+    // Over windows and icons: the haze in front glows where the sun hits it.
+    // The limit applies to the light as it would be without the shadows of the
+    // windows; the fraction they let through thus stays an even gradient up to the
+    // shadow boundary, also close to the sun.
+    float3 full = uSunCol * (L.y * uExposure * uOverWin);
+    full *= OVER_CAP / (OVER_CAP + luma(full));
+    // The fraction acts on the final brightness: in the image the light thus falls
+    // off evenly toward the shadow boundary instead of dropping off only just before
+    // it.
+    float3 under = GROUND + full * keep;
     float3 ground = develop(GROUND);
-    float3 onWindowL = max(toLinear(ground + onWindow) - toLinear(ground), 0.0);
-    return float4(lerp(onWindowL, onSkyL, known) * uWhite, alphaL * known) * quiet;
+    float3 onWindow = (develop(GROUND + full) - ground) * keep + develop(under + col + rim) - develop(under);
+    if (uLinear > 0.5) onWindow = max(toLinear(ground + onWindow) - toLinear(ground), 0.0);
+    added = onWindow * (1.0 - known);
   }
 
-  float3 fall = (was - want) / max(was, 0.004);
-  float alpha = saturate(max(fall.r, max(fall.g, fall.b)));
-  float3 onSky = max(want - was * (1.0 - alpha), 0.0);
-  float3 added = lerp(onWindow, onSky, known);
+  if (known > 0.001) {
+    // Where the sky is open, everything acts before the filmic curve: in the shadow
+    // of windows and icons the sky lacks light of the haze and gets darker, by the
+    // fraction the shadow removes, as far as the haze there matters against the sky
+    // at all. Where the sun hits the haze, light is added. This way it saturates
+    // softly instead of clipping hard to white.
+    float3 sky = skyAt(p);
+    float haze = luma(unshaded);
+    float dark = 0.85 * uShade * (1.0 - keep) * haze / (haze + 0.6 * luma(sky) + 1e-4);
+    dark = max(dark, POINTER_FLOOR * uShade * pointer);
+    float3 was = develop(sky);
+    // Close to the sun the haze scatters forward so strongly that it washed out the
+    // sky to white over a wide area: the sun appeared as a milky ball in the image.
+    // Its light therefore has an upper limit; far from the sun, where the rays lie,
+    // this changes nothing.
+    float3 veil = lit * uOverSky;
+    veil *= SKY_CAP / (SKY_CAP + luma(veil));
+    float3 sum = sky * (1.0 - dark) + veil + col + rim;
+    float3 want = develop(sum);
+    // HDR mode: there Windows blends linearly, and it accepts color without coverage
+    // only from a swap chain in HDR format (measured; from one with 8 bit it is
+    // dropped entirely). The light is therefore added linearly, at the brightness
+    // that white has in the HDR image.
+    if (uLinear > 0.5) {
+      float3 wasL = toLinear(was), wantL = toLinear(want);
+      // An HDR display can go brighter than white. What glares in the image (the sun
+      // disc, its innermost aureole, backlit cloud edges) really gets this brightness
+      // instead of ending at white.
+      float hot = smoothstep(2.5, 22.0, luma(sum));
+      wantL *= 1.0 + (max(uGlow.x, 1.0) - 1.0) * hot;
+      float3 fallL = (wasL - wantL) / max(wasL, 1e-5);
+      alpha = saturate(max(fallL.r, max(fallL.g, fallL.b)));
+      added += max(wantL - wasL * (1.0 - alpha), 0.0) * known;
+    } else {
+      float3 fall = (was - want) / max(was, 0.004);
+      alpha = saturate(max(fall.r, max(fall.g, fall.b)));
+      added += max(want - was * (1.0 - alpha), 0.0) * known;
+    }
+  }
+
+  if (uLinear > 0.5) return float4(added * uWhite, alpha * known) * quiet;
   added += (ign(pos.xy) - 0.5) / 255.0;
   return float4(max(added, 0.0), alpha * known) * quiet;
 }

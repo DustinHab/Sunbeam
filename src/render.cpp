@@ -35,8 +35,11 @@
 #include "sh/propin.h"
 #include "sh/propvs.h"
 #include "sh/rain.h"
+#include "sh/far.h"
+#include "sh/resolve.h"
 #include "sh/scatter.h"
 #include "sh/shade.h"
+#include "sh/volume.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -141,12 +144,13 @@ struct LightC {
   float cursorPar[4];
   float moonPar[4];
   float glow[4];
+  float vol[4];
   float rect[32][4];
   float par[32][4];
   float aux[32][4];
   float edge[32][4];
 };
-static_assert(sizeof(LightC) == 2304);
+static_assert(sizeof(LightC) == 2320);
 
 struct NoiseC {
   float slice, size, pad[2];
@@ -182,15 +186,37 @@ const double WORLD_EVERY = 1.0 / 62;   // everything is made anew this often; in
 const double AIR_GUARD = 96;         // the clouds extend this many logical pixels beyond the image on each side
 const double AIR_PIXELS = 3.3e6;    // air and clouds get no more pixels than this, above that it is upscaled
 const double SCATTER_PIXELS = 1.0e6;  // pixels of the scattered light at resolution 50 %
+// The haze in front of the rearmost window is summed on a coarse grid, from the
+// viewer up to each of these knots. In that haze every lookup is blurred by at
+// least 0.28 sun radii; the grid is as fine as that blur, within these bounds
+// (logical pixels per cell).
+const int VOL_KNOTS = 33;
+const float VOL_PITCH_MIN = 2.8f, VOL_PITCH_MAX = 4.0f;
+const double VOL_EVERY = 0.1;         // seconds after which these sums are made anew at the latest: the mist drifts
+const int HULL_STEPS = 32;            // steps through the whole of that haze where windows shadow it
+// The haze behind it is summed per pixel, and anew band by band: each frame one
+// band, blended into what is there.
+const int FAR_BANDS = 4;
+const float FAR_SHARE = 0.34f;        // a new band counts at least this much
+// While a window is dragged, the image for the eye is made in bands spread over
+// several frames, each about equally expensive: fractions of the image height
+// from the top. With water the lower part costs most.
+const float EYE_CUTS[] = {0, 0.5f, 1};
+const float EYE_CUTS_WATER[] = {0, 0.8f, 0.87f, 0.93f, 1};
+// A piece of the world that follows the light of a rushed frame is reckoned
+// with this many milliseconds.
+const double PIECE_ROOM = 1.1;
 // The rearmost window is this deep in the haze, as a fraction of the haze depth.
 // Behind it remains haze that no window shadows: it also glows around a window
 // that covers the sun.
 const float WINDOW_BACK = 0.72f;
-// The position of a window arrives up to one frame later than Windows draws it.
-// While a window moves, a margin around its edges therefore stays without light,
-// as wide as the window travels in that time.
-const double EDGE_LAG = 0.014;             // seconds
+// The position of a window arrives later than Windows draws it. While a window
+// moves, a margin around its edges therefore stays without light, as wide as
+// the window travels in the time the positions are expected to be off by (see
+// setScene), within these bounds; where they are computed ahead the lower one
+// is halved.
 const float EDGE_MIN = 3, EDGE_MAX = 40;   // logical pixels
+const float EDGE_SHARP = 0.004f;           // seconds: up to this lag the positions count as computed ahead
 // When a window appears or disappears, Windows plays a short animation. For that
 // long its area stays without light, then it fades in.
 const double APPEAR_HOLD = 0.10, APPEAR_DONE = 0.35, GHOST_HOLD = 0.12, GHOST_LIFE = 0.30;
@@ -540,6 +566,9 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   pixel(sh_near, sizeof(sh_near), psNear_);
   pixel(sh_nearblock, sizeof(sh_nearblock), psNearBlock_);
   pixel(sh_scatter, sizeof(sh_scatter), psScatter_);
+  pixel(sh_far, sizeof(sh_far), psFar_);
+  pixel(sh_resolve, sizeof(sh_resolve), psResolve_);
+  hr |= dev_->CreateComputeShader(sh_volume, sizeof(sh_volume), nullptr, &csVolume_);
   pixel(sh_bloompre, sizeof(sh_bloompre), psBloomPre_);
   pixel(sh_bloomdown, sizeof(sh_bloomdown), psBloomDown_);
   pixel(sh_bloomup, sizeof(sh_bloomup), psBloomUp_);
@@ -616,6 +645,7 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
 
   D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
   dev_->CreateQuery(&qd, &event_);
+  dev_->CreateQuery(&qd, &sent_);
 
   // A model that is missing or damaged simply never appears.
   for (int i = 0; i < MODEL_COUNT; i++) {
@@ -674,6 +704,74 @@ void Renderer::sync() {
   BOOL done = FALSE;
   while (ctx_->GetData(event_.Get(), &done, sizeof(done), 0) != S_OK) {
   }
+}
+
+void Renderer::submit() {
+  ctx_->End(sent_.Get());
+  ctx_->Flush();
+}
+
+bool Renderer::finished() {
+  BOOL done = FALSE;
+  return ctx_->GetData(sent_.Get(), &done, sizeof(done), 0) == S_OK;
+}
+
+// For measurements: the part of the frame that ends here; nullptr begins a
+// frame. The graphics card stamps its own clock into the stream of commands at
+// each mark, so the parts are timed where they run and without waiting in
+// between.
+void Renderer::mark(const char* part) {
+  if (!parts_) return;
+  if (!part) {
+    collect();
+    if (!disjoint_) {
+      D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+      dev_->CreateQuery(&qd, &disjoint_);
+    }
+    ctx_->Begin(disjoint_.Get());
+    stampOpen_ = true;
+  }
+  if (!stampOpen_) return;
+  if (stampUsed_ == stamps_.size()) {
+    D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP, 0};
+    ComPtr<ID3D11Query> q;
+    dev_->CreateQuery(&qd, &q);
+    stamps_.push_back(q);
+    stampName_.push_back(nullptr);
+  }
+  ctx_->End(stamps_[stampUsed_].Get());
+  stampName_[stampUsed_++] = part;
+}
+
+// Reads the marks of the frame measured last and adds them to the list.
+void Renderer::collect() {
+  if (!stampOpen_) return;
+  stampOpen_ = false;
+  ctx_->End(disjoint_.Get());
+  ctx_->Flush();
+  D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+  while (ctx_->GetData(disjoint_.Get(), &dj, sizeof(dj), 0) != S_OK) {
+  }
+  UINT64 before = 0;
+  for (size_t i = 0; i < stampUsed_; i++) {
+    UINT64 at = 0;
+    while (ctx_->GetData(stamps_[i].Get(), &at, sizeof(at), 0) != S_OK) {
+    }
+    const char* name = stampName_[i];
+    if (name && parts_ && !dj.Disjoint && dj.Frequency) {
+      auto it = std::find_if(parts_->begin(), parts_->end(), [&](const Part& p) { return !std::strcmp(p.name, name); });
+      if (it == parts_->end()) it = parts_->insert(parts_->end(), Part{name});
+      it->ms += double(at - before) * 1000.0 / double(dj.Frequency);
+      it->count++;
+    }
+    before = at;
+  }
+  stampUsed_ = 0;
+}
+
+void Renderer::profile(std::vector<Part>* into) {
+  collect();
+  parts_ = into;
 }
 
 // Tileable noise in space, generated slice by slice on the graphics card.
@@ -887,7 +985,35 @@ void Renderer::allocScatter() {
   int w = std::max(1, int(std::lround(pixW_ * k))), h = std::max(1, int(std::lround(pixH_ * k)));
   for (auto& t : scat_) t = makeTarget(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
   for (auto& t : scatFlash_) t = makeTarget(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
+  far_ = makeTarget(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
   sceneDirty_ = true;
+  hazeDirty_ = true;
+}
+
+// The grid for the sums of the haze in front of the rearmost window. Only made
+// anew when its size changes: with the display, or with the size of sun and
+// moon.
+void Renderer::allocVolume() {
+  float pitch = std::clamp(0.19f * std::min(sunRad_, moonRad_), VOL_PITCH_MIN, VOL_PITCH_MAX);
+  int w = std::max(2, int(std::lround(viewW_ / pitch))), h = std::max(2, int(std::lround(viewH_ / pitch)));
+  if (w == volW_ && h == volH_ && vol_) return;
+  volW_ = w, volH_ = h;
+  D3D11_TEXTURE3D_DESC d = {};
+  d.Width = w;
+  d.Height = h;
+  d.Depth = VOL_KNOTS;
+  d.MipLevels = 1;
+  d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+  ComPtr<ID3D11Texture3D> tex;
+  vol_.Reset();
+  volOut_.Reset();
+  dev_->CreateTexture3D(&d, nullptr, &tex);
+  if (!tex) return;
+  dev_->CreateShaderResourceView(tex.Get(), nullptr, &vol_);
+  dev_->CreateUnorderedAccessView(tex.Get(), nullptr, &volOut_);
+  hazeDirty_ = true;
 }
 
 void Renderer::resize(int pixelW, int pixelH, float scale) {
@@ -940,6 +1066,7 @@ void Renderer::resize(int pixelW, int pixelH, float scale) {
   }
   allocScatter();
   sizeBodies();
+  allocVolume();
   updateLight();
   updateDepths();
   passActive_ = false;
@@ -1222,7 +1349,8 @@ void Renderer::trackScene(const std::vector<Occluder>& list) {
     if (std::max(std::max(d[0], d[1]), std::max(d[2], d[3])) > 0.01f) {
       double dt = std::max(time_ - t.seen, 1.0 / 500);
       for (int k = 0; k < 4; k++) {
-        t.margin[k] = d[k] > 0.01f ? std::clamp(float(d[k] / dt * EDGE_LAG), EDGE_MIN, EDGE_MAX) : t.margin[k] * 0.5f;
+        t.margin[k] = d[k] > 0.01f ? std::clamp(float(d[k] / dt * lag_), lag_ <= EDGE_SHARP ? 0.5f * EDGE_MIN : EDGE_MIN, EDGE_MAX)
+                                   : t.margin[k] * 0.5f;
       }
       t.moved = time_;
     }
@@ -1237,8 +1365,9 @@ void Renderer::trackScene(const std::vector<Occluder>& list) {
   sceneSeen_ = true;
 }
 
-void Renderer::setScene(const std::vector<Occluder>& list) {
+void Renderer::setScene(const std::vector<Occluder>& list, float lag) {
   if (list == rects_) return;
+  lag_ = lag;
   trackScene(list);
   rects_ = list;
   updateDepths();
@@ -1264,6 +1393,7 @@ void Renderer::setHeaven(const Heaven& h, bool gentle) {
     paceSeen_ = 0;
     skyDirty_ = true;
     sceneDirty_ = true;
+    hazeDirty_ = true;
   }
 }
 
@@ -1281,6 +1411,7 @@ void Renderer::setIconMask(const uint8_t* cover, int w, int h) {
   iconH_ = h;
   iconDirty_ = true;
   sceneDirty_ = true;
+  hazeDirty_ = true;
 }
 
 void Renderer::setCursorShape(const uint8_t* cover, int w, int h) {
@@ -1320,6 +1451,7 @@ void Renderer::setParams(const Params& p) {
   if (!dev_ || !sky_.tex) return;
   sizeBodies();
   if (res) allocScatter();
+  allocVolume();
   if (sky) {
     updateLight();
     skyDirty_ = true;
@@ -1328,6 +1460,7 @@ void Renderer::setParams(const Params& p) {
   }
   updateDepths();
   sceneDirty_ = true;
+  hazeDirty_ = true;
 }
 
 void Renderer::drift(float fog, float temperature, float dayTemperature, float snowDepth) {
@@ -1383,7 +1516,10 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.fade = fade_;
   c.evolve = float(evolveT_);
   c.skyGain = l.gain;
-  c.time = float(std::fmod(time_, 3600.0));
+  // An image for the eye that is made band by band keeps the time of its first
+  // band.
+  double clock = faceClock_ >= 0 ? faceClock_ : time_;
+  c.time = float(std::fmod(clock, 3600.0));
   c.stars = par_.stars;
   c.span = float(columnTop_), c.count = float(columnH_);
   Sky wx = skyOf(par_.clouds);
@@ -1396,7 +1532,7 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.fog[0] = fog.ext, c.fog[1] = fog.top, c.fog[2] = fog.soft, c.fog[3] = fog.banks;
   for (int i = 0; i < 3; i++) c.fogCol[i] = l.fog[i];
   c.fogCol[3] = l.fogGlare;
-  c.storm[3] = float(std::fmod(time_, 64.0));
+  c.storm[3] = float(std::fmod(clock, 64.0));
   // The lightning: bluish white, far brighter than everything else below the
   // clouds.
   const float flashCol[3] = {8.9f, 10.1f, 12.0f};
@@ -1459,6 +1595,10 @@ void Renderer::fillLight(LightC& c) {
   // Ray length: the longer, the closer to the viewer there is still haze, and the
   // farther a shadow reaches before it fades out.
   c.nearFade = 0.6f * (1 - std::clamp(par_.length, 0.1f, 0.95f));
+  c.vol[0] = zMax_ * WINDOW_BACK;
+  c.vol[1] = float(VOL_KNOTS);
+  c.vol[2] = float(std::max(1L, std::lround(par_.steps * WINDOW_BACK / (VOL_KNOTS - 1))));
+  c.vol[3] = float(HULL_STEPS);
   c.g = par_.g;
   c.n = count_;
   c.linear = linear_ ? 1.0f : 0.0f;
@@ -2489,20 +2629,25 @@ void Renderer::faceForLight() {
 // (Redo::WATER) or nothing at all (Redo::NONE), the sky above it stays as it
 // was. What moves through the image is set into the copy every time, where it is
 // at that moment.
-void Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo) {
-  if (!skyOut) return;
+// band: only this band of the image is made anew (see eyeBands), and only with
+// the last one does the image go to the target; negative: all of it at once.
+// Returns whether the target has received the image.
+bool Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo, int band) {
+  if (!skyOut) return true;
   loadGround();
   ComPtr<ID3D11Resource> out;
   skyOut->GetResource(&out);
   ComPtr<ID3D11Texture2D> outTex;
-  if (FAILED(out.As(&outTex))) return;
+  if (FAILED(out.As(&outTex))) return true;
   D3D11_TEXTURE2D_DESC d;
   outTex->GetDesc(&d);
   if (!eye_.tex || eye_.w != int(d.Width) || eye_.h != int(d.Height) || eyeFormat_ != d.Format) {
     eye_ = makeTarget(int(d.Width), int(d.Height), d.Format, false);
     eyeFormat_ = d.Format;
     redo = Redo::ALL;
+    band = -1;
   }
+  if (redo != Redo::ALL) band = -1;
   const Ground& g = GROUNDS[groundOf(par_)];
   SkyC c;
   if (redo != Redo::NONE) {
@@ -2514,22 +2659,38 @@ void Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo) {
       D3D11_RECT cut = {0, top, pixW_, pixH_};
       ctx_->RSSetState(rasterCut_.Get());
       ctx_->RSSetScissorRects(1, &cut);
+    } else if (band >= 0) {
+      if (band == 0) faceClock_ = time_;
+      const float* cuts = g.water ? EYE_CUTS_WATER : EYE_CUTS;
+      D3D11_RECT cut = {0, LONG(std::lround(pixH_ * cuts[band])), pixW_, LONG(std::lround(pixH_ * cuts[band + 1]))};
+      ctx_->RSSetState(rasterCut_.Get());
+      ctx_->RSSetScissorRects(1, &cut);
     }
     fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
     bindClouds();
     bindGround(g.water);
     quad(psFace_.Get());
     target(nullptr, 1, 1);
+    if (band >= 0 && band + 1 < eyeBands()) return false;
+    faceClock_ = -1;
   }
   ctx_->CopyResource(out.Get(), eye_.tex.Get());
-  if (props_.empty()) return;
+  if (props_.empty()) return true;
   target(skyOut, pixW_, pixH_);
   fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
   bindClouds();
   bindGround(g.water);
   drawProps(Into::EYE, skyOut, pixW_, pixH_);
   target(nullptr, 1, 1);
+  return true;
 }
+
+// In how many bands the image for the eye is made when it is spread over
+// several frames.
+int Renderer::eyeBands() const { return GROUNDS[groundOf(par_)].water ? int(std::size(EYE_CUTS_WATER)) - 1 : int(std::size(EYE_CUTS)) - 1; }
+
+// The sums of the haze behind the rearmost window are fully averaged.
+bool Renderer::hazeSettled() const { return std::all_of(farCount_, farCount_ + FAR_BANDS, [](int n) { return n >= ACC_FRAMES; }); }
 
 // The next band of the running pass. Returns whether the pass is finished with
 // it; then the new cloud image applies, and the previous one stays for
@@ -2666,14 +2827,10 @@ void Renderer::drawBloom() {
   }
 }
 
-void Renderer::drawScatter() {
-  Target& t = scat_[cur_];
-  target(t.rtv.Get(), t.w, t.h);
-  LightC c = {};
-  c.res[0] = float(t.w), c.res[1] = float(t.h);
+// What the haze is made of, for every step that sums it.
+void Renderer::fillHaze(LightC& c) {
   c.sigma = par_.density / zMax_;
   c.jitter = float(std::fmod(shot_++ * 0.6180339887, 1.0));
-  c.alpha = 1.0f / (std::min(accum_, ACC_FRAMES - 1) + 1);
   c.steps = par_.steps;
   c.mist = par_.mist;
   // The patches of mist are as large as a good part of the screen, stretched in
@@ -2683,11 +2840,108 @@ void Renderer::drawScatter() {
   c.mistOff[0] = float(std::fmod(-time_ * 0.0032, 1.0));
   c.mistOff[1] = float(std::fmod(time_ * 0.0011, 1.0));
   c.mistOff[2] = float(std::fmod(time_ * 0.0045, 1.0));
+}
+
+// The scattered light by the direct march: every pixel through the whole haze,
+// past every window. The measure the sums below are checked against.
+void Renderer::drawScatter() {
+  Target& t = scat_[cur_];
+  target(t.rtv.Get(), t.w, t.h);
+  LightC c = {};
+  c.res[0] = float(t.w), c.res[1] = float(t.h);
+  c.alpha = 1.0f / (std::min(accum_, ACC_FRAMES - 1) + 1);
+  fillHaze(c);
   fillLight(c);
   ID3D11ShaderResourceView* in[5] = {sky_.srv.Get(), icons_.srv.Get(), scat_[1 - cur_].srv.Get(), nullptr, noise_.Get()};
   ctx_->PSSetShaderResources(0, 5, in);
   quad(psScatter_.Get());
   cur_ = 1 - cur_;
+}
+
+// The haze in front of the rearmost window, summed without the windows.
+void Renderer::drawVolume() {
+  if (!volOut_) return;
+  target(nullptr, 1, 1);
+  LightC c = {};
+  fillHaze(c);
+  fillLight(c);
+  ID3D11ShaderResourceView* in[5] = {sky_.srv.Get(), icons_.srv.Get(), nullptr, nullptr, noise_.Get()};
+  ID3D11SamplerState* samplers[2] = {clamp_.Get(), wrap_.Get()};
+  ctx_->CSSetShader(csVolume_.Get(), nullptr, 0);
+  ctx_->CSSetConstantBuffers(0, 1, lightBuf_.GetAddressOf());
+  ctx_->CSSetShaderResources(0, 5, in);
+  ctx_->CSSetSamplers(0, 2, samplers);
+  ctx_->CSSetUnorderedAccessViews(0, 1, volOut_.GetAddressOf(), nullptr);
+  ctx_->Dispatch((volW_ + 7) / 8, (volH_ + 7) / 8, 1);
+  ID3D11UnorderedAccessView* noOut = nullptr;
+  ID3D11ShaderResourceView* noIn[5] = {};
+  ctx_->CSSetUnorderedAccessViews(0, 1, &noOut, nullptr);
+  ctx_->CSSetShaderResources(0, 5, noIn);
+}
+
+// The haze behind the rearmost window, summed without the windows. band: only
+// this band of the image, negative: all of it. share: how much the new sums
+// count against those already there.
+void Renderer::drawFar(int band, float share) {
+  Target& t = far_;
+  target(t.rtv.Get(), t.w, t.h);
+  if (band >= 0) {
+    D3D11_RECT cut = {0, LONG(t.h * band / FAR_BANDS), t.w, LONG(t.h * (band + 1) / FAR_BANDS)};
+    ctx_->RSSetState(rasterCut_.Get());
+    ctx_->RSSetScissorRects(1, &cut);
+  }
+  const float factor[4] = {share, share, share, share};
+  ctx_->OMSetBlendState(blendShare_.Get(), factor, 0xffffffff);
+  LightC c = {};
+  c.res[0] = float(t.w), c.res[1] = float(t.h);
+  fillHaze(c);
+  fillLight(c);
+  ID3D11ShaderResourceView* in[5] = {sky_.srv.Get(), icons_.srv.Get(), nullptr, nullptr, noise_.Get()};
+  ctx_->PSSetShaderResources(0, 5, in);
+  quad(psFar_.Get());
+}
+
+// The scattered light from the sums: only here do the windows enter.
+void Renderer::drawResolve() {
+  Target& t = scat_[cur_];
+  target(t.rtv.Get(), t.w, t.h);
+  LightC c = {};
+  c.res[0] = float(t.w), c.res[1] = float(t.h);
+  c.alpha = 1.0f / (std::min(accum_, ACC_FRAMES - 1) + 1);
+  fillHaze(c);
+  fillLight(c);
+  ID3D11ShaderResourceView* in[3] = {sky_.srv.Get(), icons_.srv.Get(), scat_[1 - cur_].srv.Get()};
+  ID3D11ShaderResourceView* sums[2] = {vol_.Get(), far_.srv.Get()};
+  ctx_->PSSetShaderResources(0, 3, in);
+  ctx_->PSSetShaderResources(6, 2, sums);
+  quad(psResolve_.Get());
+  cur_ = 1 - cur_;
+}
+
+// The haze: its sums follow what they are made of, the scattered light follows
+// them and the windows.
+void Renderer::drawHaze(bool flowing) {
+  bool renew = hazeDirty_;
+  hazeDirty_ = false;
+  if (renew || volDue_ || time_ - volTime_ >= VOL_EVERY) {
+    drawVolume();
+    volTime_ = time_;
+    volDue_ = false;
+  }
+  mark("haze in front");
+  if (renew) {
+    drawFar(-1, 1);
+    for (int& n : farCount_) n = 1;
+    farBand_ = 0;
+  } else if (flowing || farCount_[farBand_] < ACC_FRAMES) {
+    // Each band averages in like the scattered light itself; while the haze moves,
+    // a new band keeps a fixed share.
+    float share = std::max(1.0f / (farCount_[farBand_] + 1), flowing ? FAR_SHARE : 0.0f);
+    drawFar(farBand_, share);
+    farCount_[farBand_] = std::min(farCount_[farBand_] + 1, ACC_FRAMES);
+    farBand_ = (farBand_ + 1) % FAR_BANDS;
+  }
+  mark("haze behind");
 }
 
 void Renderer::drawComposite(ID3D11RenderTargetView* lightOut) {
@@ -2774,29 +3028,26 @@ void Renderer::drawFlashLight(ID3D11RenderTargetView* lightOut) {
   flashPass_ = false;
 }
 
-Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D11RenderTargetView* lightOut) {
-  Drawn out;
-  bindCommon();
-  time_ += dt;
-  // The gust fields move over the water with the wind at the ground. Their path
-  // wraps without anything jumping: 5000 m are three tiles of the noise.
-  gustT_ = std::fmod(gustT_ + dt * surfSpeed() * 0.8, 5000.0);
+// Windows that have just moved, appeared or disappeared: as long as one of them
+// is settling, the light needs every frame. Ghosts of disappeared windows expire
+// here.
+bool Renderer::settling() {
+  size_t tracked = tracks_.size();
+  std::erase_if(tracks_, [&](const Track& t) { return t.gone > -1e8 && time_ - t.gone > GHOST_LIFE; });
+  if (tracks_.size() != tracked) updateDepths();
+  return std::any_of(tracks_.begin(), tracks_.end(), [&](const Track& t) {
+    return time_ - t.moved < 0.3 || time_ - t.born < APPEAR_DONE + 0.05 || t.gone > -1e8;
+  });
+}
 
-  // Water moves fast enough that every display refresh is visible. Everything else
-  // in the image does not need that: if the image is calm, only the strip with the
-  // water is made anew between two full frames. Clouds, light and weather catch up
-  // on the elapsed time in the next full frame.
-  owed_ += dt;
-  // Ships, aircraft and birds move on with every frame.
-  bool alive = updateLife(dt);
-  bool quiet = calm_ && !skyDirty_ && !sceneDirty_ && !iconDirty_ && !cursorMoved_ && !heavenMoved_ && !faceDue_ && !boltDue_ &&
-               flash_.level <= 0.001f && eye_.tex;
-  if (quiet && skyOut && time_ - worldTime_ < WORLD_EVERY) {
-    faceForEye(skyOut, GROUNDS[groundOf(par_)].water ? Redo::WATER : Redo::NONE);
-    out.sky = out.lively = true;
-    return out;
-  }
-  dt = owed_;
+// Everything that does not depend on the windows: clouds, weather, the finished
+// sky images. Returns what the light has to know about it.
+// defer: only the next band of the clouds is made here and now; the finished
+// images and the sums of the haze are put down as pieces of work for the frames
+// that follow (see render).
+Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, bool busy, bool defer, Drawn& out) {
+  World w;
+  double dt = owed_;
   owed_ = 0;
   worldTime_ = time_;
 
@@ -2824,15 +3075,6 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
     skyDirty_ = true;
   }
 
-  // Ghosts of disappeared windows expire.
-  size_t tracked = tracks_.size();
-  std::erase_if(tracks_, [&](const Track& t) { return t.gone > -1e8 && time_ - t.gone > GHOST_LIFE; });
-  if (tracks_.size() != tracked) updateDepths();
-  // As long as something is settling, it needs every frame.
-  bool settling = std::any_of(tracks_.begin(), tracks_.end(), [&](const Track& t) {
-    return time_ - t.moved < 0.3 || time_ - t.born < APPEAR_DONE + 0.05 || t.gone > -1e8;
-  });
-
   // Clouds. After a user change at once and in one go, so that the sky follows the
   // user's hand; otherwise band by band spread over several frames, so that no
   // single frame takes long.
@@ -2855,6 +3097,8 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
     passActive_ = false;
     mapTick_ = 0;
   }
+  // Lightning and a user change are never spread over several frames.
+  defer = defer && !urgent && !flick;
   if (urgent || drifted) drawBase();
   if (!passActive_ && (urgent || skyAccum_ < SKY_ACC || (drifting && time_ - skyTime_ >= SKY_EVERY))) {
     beginPass();
@@ -2862,11 +3106,11 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   }
   bool passDone = false;
   for (int n = urgent ? AIR_BANDS : 1; passActive_ && n > 0; n--) passDone |= stepBand();
+  mark("clouds");
 
   // The finished images. If the clouds drift, every frame moves them a bit
   // further; the one for the light needs that only occasionally, it is soft.
   bool moving = drifting && skyAccum_ > 0;
-  bool skyMoved = false;
   // A new pass fades in over the duration of the next one. After a user change it
   // applies at once, and the image before it does not fit then either.
   fade_ = moving && !urgent && airDone_ >= 2 ? std::min(1.0f, float(sinceSwitch_ + 1) / AIR_BANDS) : 1.0f;
@@ -2883,10 +3127,18 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   // times per second.
   bool shifted = alive && GROUNDS[groundOf(par_)].water && skyAccum_ > 0 && time_ - lightTime_ >= 1.0 / 31 && propsShifted();
   if (passDone || drifted || tick || due || flick || shifted) {
-    faceForLight();
-    if (urgent) sceneDirty_ = true;
-    else if (passDone || drifted || flick || faceTick_ % 4 == 0) skyMoved = true;
+    bool glare = !urgent && (passDone || drifted || flick || faceTick_ % 4 == 0);
+    if (defer) {
+      jobs_.push_back(glare ? Job::FOR_LIGHT_AND_GLARE : Job::FOR_LIGHT);
+    } else {
+      faceForLight();
+      // The sums of the haze read the clouds from this image.
+      volDue_ = true;
+      if (urgent) sceneDirty_ = hazeDirty_ = true;
+      w.glare = glare;
+    }
   }
+  mark("sky for light");
   // At night the stars twinkle: even without drifting clouds a frame at intervals.
   bool twinkling = light_.night > 0.3f && par_.stars > 0 && skyAccum_ > 0 && time_ - faceTime_ > 1.0 / 20;
   // Water is always in motion.
@@ -2895,17 +3147,79 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   rippling = rippling || (rainHere_ > 0.003f && skyAccum_ > 0);
   if (passDone || moving || drifted || twinkling || rippling || due || flick) {
     faceTime_ = time_;
-    faceForEye(skyOut);
-    out.sky = skyOut != nullptr;
+    if (defer && skyOut) {
+      for (int band = 0; band < eyeBands(); band++) jobs_.push_back(Job::EYE);
+    } else {
+      faceForEye(skyOut);
+      out.sky = skyOut != nullptr;
+    }
   } else if (alive && skyAccum_ > 0) {
     // Nothing but a ship, an aircraft or a bird has moved: the sky stays as it is.
-    faceForEye(skyOut, Redo::NONE);
-    out.sky = skyOut != nullptr;
+    if (defer && skyOut) {
+      jobs_.push_back(Job::EYE_AS_IT_IS);
+    } else {
+      faceForEye(skyOut, Redo::NONE);
+      out.sky = skyOut != nullptr;
+    }
   }
   // The image is calm when nothing except the water and what moves through the
   // image needs every refresh.
-  calm_ = (GROUNDS[groundOf(par_)].water || !props_.empty()) && skyAccum_ >= SKY_ACC && !urgent && !settling && !flick && rainHere_ <= 0.003f;
+  calm_ = (GROUNDS[groundOf(par_)].water || !props_.empty()) && skyAccum_ >= SKY_ACC && !urgent && !busy && !flick && rainHere_ <= 0.003f;
+  mark("sky for eye");
+  // What moves by itself flows in gradually; after a user change the averaging
+  // starts anew so that the light follows at once.
+  w.flowing = drifting || par_.mist > 0 || drifted;
+  w.flick = flick;
+  if (defer && !reference_) jobs_.push_back(Job::HAZE);
+  return w;
+}
 
+// Works off pieces of the world that a rushed frame has put down, at most this
+// many.
+void Renderer::runJobs(ID3D11RenderTargetView* skyOut, int pieces, Drawn& out) {
+  while (pieces-- > 0 && !jobs_.empty()) {
+    Job job = jobs_.front();
+    jobs_.erase(jobs_.begin());
+    switch (job) {
+      case Job::FOR_LIGHT:
+      case Job::FOR_LIGHT_AND_GLARE:
+        faceForLight();
+        volDue_ = true;
+        if (job == Job::FOR_LIGHT_AND_GLARE) glareDue_ = true;
+        mark("sky for light");
+        break;
+      case Job::EYE:
+        // Band by band; with the last one the image is complete and goes out.
+        if (skyOut && faceForEye(skyOut, Redo::ALL, eyeBand_)) {
+          // The image was finished ahead of its bands: the remaining ones are void.
+          std::erase(jobs_, Job::EYE);
+          eyeBand_ = 0;
+          out.sky = true;
+        } else {
+          eyeBand_++;
+        }
+        mark("sky for eye");
+        break;
+      case Job::EYE_AS_IT_IS:
+        if (skyOut) {
+          faceForEye(skyOut, Redo::NONE);
+          out.sky = true;
+        }
+        mark("sky for eye");
+        break;
+      case Job::HAZE:
+        drawHaze(true);
+        resolveDue_ = true;
+        break;
+    }
+  }
+}
+
+// The light over the desktop: glare, scattered light, composition.
+// glare: the sky has moved on, the glare follows. flowing: the haze moves by
+// itself, the scattered light follows in every frame. rush: only what the
+// windows and the pointer have changed.
+void Renderer::drawLight(ID3D11RenderTargetView* lightOut, bool busy, bool glare, bool flowing, bool flick, bool rush, Drawn& out) {
   if (iconDirty_) {
     uploadIcons();
     iconDirty_ = false;
@@ -2914,26 +3228,110 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
     drawBloom();
     accum_ = 0;
     sceneDirty_ = false;
-  } else if (skyMoved) {
+  } else if (glare) {
     drawBloom();
   }
-  // What moves by itself flows in gradually; after a user change the averaging
-  // starts anew so that the light follows at once.
-  bool flowing = drifting || par_.mist > 0 || drifted;
+  mark("glare");
   bool fresh = false;
+  // In a rush the sums of the haze follow as pieces of the world, unless they
+  // have to start over.
+  if (!reference_ && (!rush || hazeDirty_)) drawHaze(flowing);
   if (accum_ < ACC_FRAMES || flowing) {
-    drawScatter();
+    if (reference_) drawScatter();
+    else drawResolve();
     accum_ = std::min(accum_ + 1, ACC_FRAMES);
     fresh = true;
   }
-  if ((fresh || par_.dust > 0 || settling || cursorMoved_ || flick) && lightOut) {
+  mark("scattered light");
+  // The dust drifts: without anything else, a frame for it sixty times a second.
+  bool dusty = par_.dust > 0 && (!rush || time_ - lightDrawn_ >= WORLD_EVERY);
+  if ((fresh || dusty || busy || cursorMoved_ || flick) && lightOut) {
     cursorMoved_ = false;
+    lightDrawn_ = time_;
     drawComposite(lightOut);
     // If there is lightning, its light is added: past windows and icons like that of
     // the sun.
     if (flash_.level > 0.001f) drawFlashLight(lightOut);
     out.light = true;
   }
+  mark("composition");
+}
+
+// What a rushed frame has left to do once its light is on its way: pieces of
+// the world, as many as fit into the seconds of room until the next frame of
+// the light has to start, but at least one. Outside a rush nothing.
+Renderer::Drawn Renderer::after(ID3D11RenderTargetView* skyOut, double room) {
+  Drawn out;
+  if (!afterDue_) return out;
+  afterDue_ = false;
+  bindCommon();
+  int pieces = std::max(1, int(room * 1000 / PIECE_ROOM));
+  if (jobs_.empty() && time_ - worldTime_ >= WORLD_EVERY) {
+    drawWorld(skyOut, afterAlive_, afterBusy_, true, out);
+    pieces--;
+  }
+  runJobs(skyOut, pieces, out);
+  target(nullptr, 1, 1);
+  // On its way at once: it has to be through before the next frame of the light.
+  ctx_->Flush();
+  return out;
+}
+
+// period: seconds between two display refreshes if the caller is in a rush, that
+// is, a window or the pointer is moving and the light has to follow with every
+// refresh; 0 otherwise.
+//
+// In a rush the light comes first in every frame, and it must not wait for the
+// world: this call then makes the light only. The caller hands it to Windows
+// and calls after(); there clouds and sky move on in pieces, one or a few per
+// frame, each small enough to fit between two frames of the light.
+Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D11RenderTargetView* lightOut, double period) {
+  Drawn out;
+  mark(nullptr);
+  bindCommon();
+  time_ += dt;
+  // The gust fields move over the water with the wind at the ground. Their path
+  // wraps without anything jumping: 5000 m are three tiles of the noise.
+  gustT_ = std::fmod(gustT_ + dt * surfSpeed() * 0.8, 5000.0);
+
+  // Water moves fast enough that every display refresh is visible. Everything else
+  // in the image does not need that: if the image is calm, only the strip with the
+  // water is made anew between two full frames. Clouds, light and weather catch up
+  // on the elapsed time in the next full frame.
+  owed_ += dt;
+  // Ships, aircraft and birds move on with every frame.
+  bool alive = updateLife(dt);
+  bool busy = settling();
+
+  bool rush = period > 0 && !skyDirty_ && skyAccum_ > 0 && eye_.tex && !boltDue_ && flash_.level <= 0.001f && flashDrawn_ <= 0.001f && !reference_;
+  if (rush) {
+    bool glare = glareDue_, flowing = resolveDue_;
+    glareDue_ = resolveDue_ = false;
+    // A world that was not called for after the last frame moves on first.
+    if (afterDue_) after(skyOut, 0);
+    drawLight(lightOut, busy, glare, flowing, false, true, out);
+    afterDue_ = true;
+    afterAlive_ = alive;
+    afterBusy_ = busy;
+    out.lively = calm_;
+    target(nullptr, 1, 1);
+    return out;
+  }
+  // Whatever a rush has left behind comes first.
+  afterDue_ = false;
+  runJobs(skyOut, int(jobs_.size()), out);
+
+  bool quiet = calm_ && !skyDirty_ && !sceneDirty_ && !iconDirty_ && !cursorMoved_ && !heavenMoved_ && !faceDue_ && !boltDue_ &&
+               flash_.level <= 0.001f && eye_.tex;
+  if (quiet && skyOut && time_ - worldTime_ < WORLD_EVERY) {
+    faceForEye(skyOut, GROUNDS[groundOf(par_)].water ? Redo::WATER : Redo::NONE);
+    out.sky = out.lively = true;
+    mark("water");
+    return out;
+  }
+  World w = drawWorld(skyOut, alive, busy, false, out);
+  drawLight(lightOut, busy, w.glare || glareDue_, w.flowing || resolveDue_, w.flick, false, out);
+  glareDue_ = resolveDue_ = false;
   // While the light is still averaging in, every full frame counts.
   calm_ = calm_ && accum_ >= ACC_FRAMES;
   out.lively = calm_;

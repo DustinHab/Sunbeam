@@ -39,6 +39,9 @@ set FXC=fxc /nologo /O2
 %FXC% /T ps_5_0 /E Prop        /Vn sh_prop        /Fh out\sh\prop.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Lamp        /Vn sh_lamp        /Fh out\sh\lamp.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Scatter     /Vn sh_scatter     /Fh out\sh\scatter.h     shader\light.hlsl >nul || goto failed
+%FXC% /T cs_5_0 /E Volume      /Vn sh_volume      /Fh out\sh\volume.h      shader\light.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Far         /Vn sh_far         /Fh out\sh\far.h         shader\light.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Resolve     /Vn sh_resolve     /Fh out\sh\resolve.h     shader\light.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E BloomPre    /Vn sh_bloompre    /Fh out\sh\bloompre.h    shader\light.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E BloomDown   /Vn sh_bloomdown   /Fh out\sh\bloomdown.h   shader\light.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E BloomUp     /Vn sh_bloomup     /Fh out\sh\bloomup.h     shader\light.hlsl >nul || goto failed

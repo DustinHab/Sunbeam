@@ -23,6 +23,7 @@
 #include "astro.h"
 #include "check.h"
 #include "daycycle.h"
+#include "motion.h"
 #include "panel.h"
 #include "render.h"
 #include "scene.h"
@@ -45,6 +46,16 @@ enum Course { BY_HAND = 0, BY_CLOCK = 1, TIME_LAPSE = 2 };   // course of the su
 const double CALM = 1.0 / 60;    // without a user change, at least this much time lies between two frames
 const double BUSY = 1.0 / 250;   // after a user change the light follows as fast as the display shows frames
 const double SCENE_EVERY = 0.25; // the window positions are re-read at least this often
+// While a window is dragged or the pointer moves, a frame is made for every
+// display refresh (see Beat and Lead). That pace is kept this long after the
+// last movement.
+const double RUSH_AFTER = 0.3;
+// The start of such a frame has to be punctual: the timer wakes this much
+// ahead of it, and the thread runs with raised priority meanwhile.
+const double WAKE_EARLY = 0.0005;
+// The positions a frame is made for are expected to be off by this much time of
+// travel: computed ahead from the pointer, or merely as last read.
+const float LAG_LED = 0.002f, LAG_READ = 0.007f;
 const int ICONS_EVERY_MS = 1500;
 const int SETTINGS_LEVEL = 5;    // increases when defaults have been retuned
 
@@ -131,6 +142,9 @@ struct App {
   std::atomic<bool> iconReady{false}, iconStop{false};
   double iconMs = 0;
   bool sceneEvent = true;   // a window has moved, the positions have to be re-read
+  Motion motion;            // follows the pointer and a dragged window
+  HWND followed = nullptr;  // the window whose position currently comes from there
+  HANDLE timer = nullptr;   // for waits of fractions of a millisecond
   bool placing = false;     // the next click places the sun
   bool paused = false;
   bool covered = false;     // a full-screen application is in front, the light is idle
@@ -143,6 +157,7 @@ struct App {
   HCURSOR cursorHandle = nullptr;
   int cursorW = 0, cursorH = 0;   // area of the shape including the free margin, device pixels
   POINT cursorHot{}, cursorAt{};
+  POINT cursorShown{};            // where the image has it: ahead of cursorAt while it moves
   bool cursorOn = false;
   double cursorSeen = 0;
   float cursorCalm = 1;           // 1 at rest, 0 during fast movement
@@ -152,6 +167,7 @@ struct App {
   bool rebuild = false;     // display or shell have changed, rebuild everything
   bool quit = false;
   double probe = 0;         // probe run: run this many seconds, no icon in the notification area, then exit
+  bool blind = false;       // probe run that shows nothing: sky and light stay hidden, the loop runs as if the desktop lay open
 };
 
 App* app = nullptr;
@@ -585,14 +601,14 @@ void addTray() {
 // ---- Windows ----
 
 void showLight(bool on) {
-  if (app->light) ShowWindow(app->light, on ? SW_SHOWNOACTIVATE : SW_HIDE);
+  if (app->light && !app->blind) ShowWindow(app->light, on ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
 // Places the sky directly behind the icon view and shows it on request. Showing
 // alone is not enough: it can then move in front of the icons, cover them and
 // intercept the mouse.
 void placeSky(bool show) {
-  if (!app->sky) return;
+  if (!app->sky || app->blind) return;
   SetWindowPos(app->sky, app->iconView ? app->iconView : HWND_TOP, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : 0));
 }
@@ -963,7 +979,9 @@ bool readPointerShape(HCURSOR cursor, std::vector<uint8_t>& cover, int& w, int& 
 
 // Reports shape and position of the mouse pointer to the renderer. Returns
 // whether anything has changed and a new frame is due.
-bool trackPointer(double t) {
+// ahead: where the pointer will be when the frame appears; the image is made
+// for that position.
+bool trackPointer(double t, const POINT* ahead = nullptr) {
   CURSORINFO ci = {sizeof(ci)};
   bool on = app->par.pointer > 0 && GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor;
   bool changed = false;
@@ -992,12 +1010,18 @@ bool trackPointer(double t) {
     return true;
   }
   POINT at = ci.ptScreenPos;
+  // The image is made for where the pointer will be. Once it rests, that settles
+  // on where it is, a few frames after its last movement.
+  POINT shown = ahead ? *ahead : at;
+  if (shown.x != app->cursorShown.x || shown.y != app->cursorShown.y) changed = true;
+  app->cursorShown = shown;
   double dt = std::max(t - app->cursorSeen, 1e-3);
   if (!app->cursorOn || at.x != app->cursorAt.x || at.y != app->cursorAt.y) {
     // During fast movement the light visibly lags behind the pointer; the fringe
     // that lies close to it is then suspended.
+    // Computed ahead it lags far less: the fringe then stays up to a higher speed.
     double speed = app->cursorOn ? std::hypot(double(at.x - app->cursorAt.x), double(at.y - app->cursorAt.y)) / app->mon.scale / dt : 0;
-    double fast = std::clamp((speed - 500) / 1500, 0.0, 1.0);
+    double fast = ahead ? std::clamp((speed - 2500) / 3500, 0.0, 1.0) : std::clamp((speed - 500) / 1500, 0.0, 1.0);
     app->cursorCalm = std::min(app->cursorCalm, float(1 - fast * fast * (3 - 2 * fast)));
     changed = true;
   } else if (app->cursorCalm < 1) {
@@ -1009,8 +1033,8 @@ bool trackPointer(double t) {
   app->cursorOn = true;
   if (changed) {
     float s = app->mon.scale;
-    float x0 = (at.x - app->mon.rect.left - app->cursorHot.x - POINTER_PAD) / s;
-    float y0 = (at.y - app->mon.rect.top - app->cursorHot.y - POINTER_PAD) / s;
+    float x0 = (shown.x - app->mon.rect.left - app->cursorHot.x - POINTER_PAD) / s;
+    float y0 = (shown.y - app->mon.rect.top - app->cursorHot.y - POINTER_PAD) / s;
     app->render.setCursor(true, x0, y0, x0 + app->cursorW / s, y0 + app->cursorH / s, app->cursorCalm);
   }
   return changed;
@@ -1019,7 +1043,13 @@ bool trackPointer(double t) {
 void CALLBACK onWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LONG, DWORD, DWORD) {
   if (!app || object != OBJID_WINDOW || !hwnd) return;
   // Only top-level windows count; sliders, lists and the like move all the time.
-  if (event == EVENT_OBJECT_LOCATIONCHANGE && GetAncestor(hwnd, GA_ROOT) != hwnd) return;
+  if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return;
+    // A window on the move is followed from now on; while it is, its position
+    // comes from there and nothing has to be re-read for it.
+    app->motion.note(hwnd);
+    if (hwnd == app->followed) return;
+  }
   app->sceneEvent = true;
 }
 
@@ -1155,6 +1185,8 @@ void iconWorker(Monitor mon) {
 }
 
 void teardown() {
+  app->motion.stop();
+  app->followed = nullptr;
   if (app->iconThread.joinable()) {
     app->iconStop = true;
     app->iconThread.join();
@@ -1221,7 +1253,7 @@ bool setup() {
   }
   factory->MakeWindowAssociation(app->sky, DXGI_MWA_NO_ALT_ENTER);
   if (!makeRtv(app->skyChain.Get(), app->skyRtv)) return false;
-  if (!attachSky()) {
+  if (!app->blind && !attachSky()) {
     logf(L"Sky: layer behind the icons not found");
     return false;
   }
@@ -1274,8 +1306,8 @@ bool setup() {
   // Start empty: alpha zero means nothing is added.
   float clear[4] = {0, 0, 0, 0};
   app->ctx->ClearRenderTargetView(app->lightRtv.Get(), clear);
-  app->lightChain->Present(0, 0);
-  ShowWindow(app->light, SW_SHOWNOACTIVATE);
+  if (!app->blind) app->lightChain->Present(0, 0);
+  showLight(true);
 
   // Safety: the light window must never swallow clicks. If a point in the center
   // of the image hits the program's own window, it is removed again at once.
@@ -1298,6 +1330,7 @@ bool setup() {
   app->cursorHandle = nullptr;
   app->cursorOn = false;
   app->iconThread = std::thread(iconWorker, app->mon);
+  app->motion.start();
 
   if (app->probe <= 0) addTray();
   app->hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE, nullptr, onWinEvent, 0, 0,
@@ -1310,7 +1343,13 @@ void readScene() {
   Scene s = captureScene(app->mon, {app->sky, app->light, app->host});
   // In full screen and when a maximized window covers the desktop, everything is
   // idle.
-  bool covered = (s.fullscreen || s.buried) && !app->placing;
+  bool covered = (s.fullscreen || s.buried) && !app->placing && !app->blind;
+  // A blind run acts as if the desktop lay open: windows that fill the screen
+  // count as put away.
+  if (app->blind) {
+    float area = float(app->mon.width()) * app->mon.height() / (app->mon.scale * app->mon.scale);
+    std::erase_if(s.rects, [&](const Occluder& o) { return o.kind == 1 && (o.x1 - o.x0) * (o.y1 - o.y0) > 0.9f * area; });
+  }
   // New windows that want to stay always on top would otherwise lie over the
   // light.
   static double raised = 0;
@@ -1321,6 +1360,9 @@ void readScene() {
   app->rects = s.rects;
   if (covered != app->covered) {
     app->covered = covered;
+    // Behind a program that fills the screen nothing is urgent: the graphics card
+    // is left to it.
+    standAside(covered);
     if (!covered) app->freeSince = now();
     showLight(!covered && !app->paused);
     // The first changes are logged, later ones are not, so that the log stays small.
@@ -1463,22 +1505,102 @@ void saveLook(const wchar_t* base, const wchar_t* close, int cx, int cy) {
   for (const Occluder& o : app->rects) logf(L"  rect %6.0f %6.0f %6.0f %6.0f  kind %d  opacity %.2f", o.x0, o.y0, o.x1, o.y1, o.kind, o.opacity);
 }
 
+// Waits until the time `until`, to a fraction of a millisecond, and handles
+// messages meanwhile. onEvent: returns as soon as a window has changed. early:
+// the timer is set this much ahead, the rest is spent spinning; the more, the
+// more punctual. Returns false if the program is to end or to be rebuilt.
+bool waitUntil(double until, bool onEvent = false, double early = 0.00015) {
+  for (;;) {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) app->quit = true;
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    if (app->quit || app->rebuild) return false;
+    if (onEvent && app->sceneEvent) return true;
+    double left = until - now();
+    if (left <= 0) return true;
+    if (left < early + 0.00005) {
+      // The last stretch by spinning: no timer is that exact.
+      while (now() < until) YieldProcessor();
+      return true;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -LONGLONG((left - early) * 1e7);
+    if (app->timer && SetWaitableTimer(app->timer, &due, 0, nullptr, nullptr, FALSE)) {
+      MsgWaitForMultipleObjects(1, &app->timer, FALSE, 200, QS_ALLINPUT);
+    } else {
+      MsgWaitForMultipleObjects(0, nullptr, FALSE, DWORD(std::clamp(left * 1000, 1.0, 200.0)), QS_ALLINPUT);
+    }
+  }
+}
+
+// A frame made in a rush: the refresh it was made for and where it put the
+// window in motion.
+struct Flight {
+  bool open = false;
+  double sent = 0;    // when it was begun
+  double latch = 0;
+  HWND window = nullptr;
+  RECT frame{};
+  bool led = false;
+};
+
+// What a stretch of rushed frames amounted to, for the log.
+struct Tally {
+  double began = 0;
+  int frames = 0, late = 0;      // frames, and those not finished by their refresh
+  int judged = 0, led = 0;       // positions compared with what was read later, and those computed ahead
+  double off = 0, worst = 0;     // how far they were off, pixels: sum and largest
+  double leadSum = 0;
+  Motion::Model model;           // how the window followed the pointer
+};
+
+void tell(const Tally& y, double t, const Beat& beat) {
+  // A probe run also tells of the stretches in which only the pointer moved.
+  if (app->probe > 0 && y.judged < 20 && y.frames >= 30) {
+    logf(L"Pointer moved for %.1f s: %d frames at %.0f Hz, %d not finished in time, started %.2f ms ahead", t - y.began, y.frames, 1 / beat.period,
+         y.late, y.leadSum / y.frames * 1000);
+  }
+  // Only stretches in which a window moved, and only the first ones: the log
+  // stays small.
+  static int told = 0;
+  if (y.judged < 20 || told++ >= 60) return;
+  logf(L"Window dragged for %.1f s: %d frames at %.0f Hz, %d not finished in time, started %.2f ms ahead; position computed ahead in %d %% of them, "
+       L"off by %.1f px on average, at most %.0f px; window %.0f ms behind the pointer, moved every %.1f ms",
+       t - y.began, y.frames, 1 / beat.period, y.late, y.frames ? y.leadSum / y.frames * 1000 : 0.0, y.judged ? 100 * y.led / y.judged : 0,
+       y.judged ? y.off / y.judged : 0.0, y.worst, y.model.delay * 1000, y.model.step * 1000);
+}
+
 // The loop, until the program is to exit or to be rebuilt.
 void run() {
   double lastDraw = 0, lastScene = 0, lastIni = 0;
   bool dirty = true;
   double begin = now(), spent = 0, worst = 0;
+  double partBefore = 0, partIssue = 0, partCard = 0;   // probe run: where the time of a frame goes
   int frames = 0, skies = 0, lights = 0;
   bool settledTold = false;
   HRESULT skyResult = S_OK, lightResult = S_OK;
   // If water moves in the image, a frame is made on every display refresh.
   bool lively = false;
+  // While a window is dragged or the pointer moves: a frame for every refresh,
+  // made for where things will be when it appears.
+  Beat beat;
+  Lead lead;
+  double rushUntil = 0;
+  bool rushing = false;
+  Flight flight;
+  std::vector<Flight> owed;
+  Tally tally;
   while (!app->quit && !app->rebuild) {
     double t = now();
     if (app->probe > 0 && t - begin > app->probe) {
       POINT mid = {(app->mon.rect.left + app->mon.rect.right) / 2, (app->mon.rect.top + app->mon.rect.bottom) / 2};
       logf(L"Probe run: %d frames, mean %.2f ms, longest %.2f ms, sky shown %d times (%08x), light %d times (%08x)", frames,
            frames ? spent / frames * 1000 : 0.0, worst * 1000, skies, skyResult, lights, lightResult);
+      logf(L"Of that: %.2f ms before the frame, %.2f ms to issue it, %.2f ms until the graphics card was through", frames ? partBefore / frames * 1000 : 0.0,
+           frames ? partIssue / frames * 1000 : 0.0, frames ? partCard / frames * 1000 : 0.0);
       logf(L"Sky visible %d, light visible %d, click at screen center hits the light: %d", IsWindowVisible(app->sky),
            IsWindowVisible(app->light), WindowFromPoint(mid) == app->light);
       app->quit = true;
@@ -1489,9 +1611,85 @@ void run() {
     bool resting = app->covered && app->render.skySettled();
     bool active = app->probe > 0 || (!app->paused && !resting);
     if (!active) lively = false;
-    double due = lastDraw + (dirty ? BUSY : CALM);
-    DWORD wait = !active ? 250 : DWORD(std::clamp((due - t) * 1000.0, 0.0, 250.0));
-    if (lively && !dirty) {
+    // The light is on the screen: only then is anything followed.
+    bool open = !app->paused && !app->covered;
+    app->motion.enable(open);
+    Motion::Guess ahead = open ? app->motion.guess(t, t) : Motion::Guess();
+    if (open && (ahead.moving || (ahead.stirred && app->par.pointer > 0))) rushUntil = t + RUSH_AFTER;
+    bool rush = open && t < rushUntil;
+    if (rush != rushing) {
+      rushing = rush;
+      SetThreadPriority(GetCurrentThread(), rush ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_NORMAL);
+      if (rush) {
+        tally = Tally();
+        tally.began = t;
+      } else {
+        tell(tally, t, beat);
+        // From here on the positions are read again.
+        app->followed = nullptr;
+        app->sceneEvent = true;
+        flight.open = false;
+        owed.clear();
+      }
+    }
+
+    double latch = 0;
+    if (rush) {
+      // The frame in flight: was the graphics card through with it in time?
+      if (flight.open) {
+        double took = -1;
+        for (;;) {
+          double n = now();
+          if (app->render.finished()) {
+            took = n - flight.sent;
+            break;
+          }
+          if (n >= flight.latch - Lead::ROOM || !waitUntil(std::min(n + 0.0003, flight.latch - Lead::ROOM))) break;
+        }
+        if (app->quit || app->rebuild) break;
+        lead.judge(took, beat.period);
+        tally.frames++;
+        tally.late += took < 0;
+        tally.leadSum += lead.value;
+        if (flight.window) owed.push_back(flight);
+        flight.open = false;
+      }
+      // The next one starts as late as it can before the refresh it is for. If the
+      // wait overran, it is made for the refresh after: a frame that starts late
+      // arrives late. Not more than twice, though: on a computer that never wakes
+      // in time a late frame is better than none.
+      for (int tries = 0;; tries++) {
+        t = now();
+        beat.update(t);
+        latch = beat.next(t + lead.value - Lead::SLACK);
+        if (!waitUntil(latch - lead.value, false, WAKE_EARLY)) break;
+        t = now();
+        if (latch - t >= lead.value - Lead::SLACK - 0.00005 || tries >= 2) break;
+      }
+      if (app->quit || app->rebuild) break;
+      ahead = app->motion.guess(latch, latch + beat.period);
+      // Earlier frames whose refresh has passed: where was the window really?
+      for (auto it = owed.begin(); it != owed.end();) {
+        if (t < it->latch + 0.002) {
+          ++it;
+          continue;
+        }
+        RECT was;
+        if (app->motion.frameAt(it->latch, it->window, was)) {
+          double off = std::max(std::max(std::abs(was.left - it->frame.left), std::abs(was.top - it->frame.top)),
+                                std::max(std::abs(was.right - it->frame.right), std::abs(was.bottom - it->frame.bottom)));
+          tally.judged++;
+          tally.led += it->led;
+          tally.off += off;
+          tally.worst = std::max(tally.worst, off);
+        }
+        it = owed.erase(it);
+      }
+      if (ahead.led) tally.model = app->motion.model();
+    } else if (!active) {
+      MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
+      if (!waitUntil(0)) break;
+    } else if (lively && !dirty) {
       // Wait for the next refresh. If the answer comes immediately several times in a
       // row (display off, session locked), there is no refresh: then continue at the
       // calm rate. Immediately once only means that the refresh was just due.
@@ -1500,20 +1698,16 @@ void run() {
       bool failed = FAILED(DwmFlush());
       instant = now() - before < 0.0005 ? instant + 1 : 0;
       if (failed || instant > 8) lively = false;
-      wait = 0;
-    }
-    MsgWaitForMultipleObjects(0, nullptr, FALSE, wait, QS_ALLINPUT);
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      if (msg.message == WM_QUIT) app->quit = true;
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
+      if (!waitUntil(0)) break;
+    } else {
+      if (!waitUntil(lastDraw + (dirty ? BUSY : CALM), true)) break;
     }
     if (app->quit || app->rebuild) break;
     t = now();
-    if (pollPlace()) dirty = true;
 
-    if (t - lastIni > 1.0) {
+    // Once a second, but never between two rushed frames: some of it takes long.
+    if (!rush && pollPlace()) dirty = true;
+    if (!rush && t - lastIni > 1.0) {
       lastIni = t;
       app->lookArmed = GetFileAttributesW(app->lookFlag.c_str()) != INVALID_FILE_ATTRIBUTES;
       placeGrip();
@@ -1549,7 +1743,7 @@ void run() {
       applyClimate(false);
     }
     if (app->paused) continue;
-    if (app->sceneEvent || t - lastScene > SCENE_EVERY) {
+    if (app->sceneEvent || (!rush && t - lastScene > SCENE_EVERY)) {
       dirty |= app->sceneEvent;
       app->sceneEvent = false;
       lastScene = t;
@@ -1563,8 +1757,23 @@ void run() {
       dirty = true;   // as soon as the desktop is uncovered again, a frame at once
       continue;
     }
+    // The window in motion is put where it will be when this frame appears.
+    app->followed = rush && ahead.moving ? ahead.window : nullptr;
+    if (rush && ahead.window) {
+      std::vector<Occluder> scene = app->rects;
+      uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(ahead.window));
+      float s = app->mon.scale;
+      bool found = false;
+      for (Occluder& o : scene) {
+        if (o.id != id) continue;
+        o.x0 = (ahead.frame.left - app->mon.rect.left) / s, o.y0 = (ahead.frame.top - app->mon.rect.top) / s;
+        o.x1 = (ahead.frame.right - app->mon.rect.left) / s, o.y1 = (ahead.frame.bottom - app->mon.rect.top) / s;
+        found = true;
+      }
+      if (found) app->render.setScene(scene, ahead.led ? LAG_LED : LAG_READ);
+    }
     if (updateHeaven(t)) dirty = true;
-    if (trackPointer(t)) dirty = true;
+    if (trackPointer(t, rush ? &ahead.pointer : nullptr)) dirty = true;
     if (app->iconReady.exchange(false)) {
       std::lock_guard<std::mutex> hold(app->iconLock);
       app->render.setIconMask(app->iconMask.data(), app->mon.width(), app->mon.height());
@@ -1580,15 +1789,18 @@ void run() {
       app->gripDue = false;
       placeGrip(true);
     }
-    if (t < lastDraw + (dirty || lively ? BUSY : CALM) - 0.0005) continue;
+    if (!rush && t < lastDraw + (dirty || lively ? BUSY : CALM) - 0.0005) continue;
 
     double dt = lastDraw > 0 ? std::min(t - lastDraw, 0.1) : 0;
     lastDraw = t;
     dirty = false;
-    Renderer::Drawn drawn = app->render.render(dt, app->skyRtv.Get(), app->lightRtv.Get());
+    double issued = now();
+    Renderer::Drawn drawn = app->render.render(dt, app->skyRtv.Get(), app->lightRtv.Get(), rush ? beat.period : 0);
     lively = drawn.lively;
+    // A blind run hands nothing to Windows: a hidden window takes no images, and
+    // the handing over would wait for it.
     if (drawn.sky) {
-      skyResult = app->skyChain->Present(0, 0);
+      if (!app->blind) skyResult = app->skyChain->Present(0, 0);
       skies++;
       // Show only now, otherwise an empty surface would briefly be behind the icons.
       if (!app->skyUp) {
@@ -1599,9 +1811,29 @@ void run() {
       }
     }
     if (drawn.light) {
-      lightResult = app->lightChain->Present(0, 0);
+      if (!app->blind) lightResult = app->lightChain->Present(0, 0);
       lights++;
       if (lightResult == DXGI_ERROR_DEVICE_REMOVED || lightResult == DXGI_ERROR_DEVICE_RESET) app->quit = true;
+    }
+    if (rush) {
+      // The light is on its way; only now the pieces of the sky that are due.
+      app->render.submit();
+      if (app->render.after(app->skyRtv.Get(), beat.period - lead.value - 0.0005).sky) {
+        if (!app->blind) skyResult = app->skyChain->Present(0, 0);
+        skies++;
+      }
+      flight.open = true;
+      flight.sent = t;
+      flight.latch = latch;
+      flight.window = ahead.moving ? ahead.window : nullptr;
+      flight.frame = ahead.frame;
+      flight.led = ahead.led;
+      // The positions of the other windows are re-read after the frame is on its
+      // way, not before it.
+      if (now() - lastScene > SCENE_EVERY) {
+        lastScene = now();
+        readScene();
+      }
     }
     if (app->lookArmed && !app->covered && app->probe <= 0 && t - app->freeSince > 2.0) {
       app->lookArmed = false;
@@ -1623,18 +1855,24 @@ void run() {
            app->render.cloudShift());
     }
     if (app->probe > 0) {
+      double sent = now();
       app->render.sync();
+      partBefore += issued - t;
+      partIssue += sent - issued;
+      partCard += now() - sent;
       double took = now() - t;
       spent += took;
       worst = std::max(worst, took);
       frames++;
     }
   }
+  if (rushing) tell(tally, now(), beat);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 }
 
 }  // namespace
 
-int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir) {
+int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir, bool blind) {
   // Only one running Sunbeam. A probe run does not hold this lock, so that it
   // never blocks the actual start.
   HANDLE once = nullptr;
@@ -1647,6 +1885,7 @@ int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir
   app = &state;
   app->inst = instance;
   app->probe = probeSeconds;
+  app->blind = blind && probeSeconds > 0;
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   if (probeSeconds > 0) {
@@ -1680,6 +1919,11 @@ int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir
   syncWeather();
   applyClimate(true);
   if (fresh) saveSettings();
+
+  // A timer that keeps to fractions of a millisecond (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION); on systems
+  // without one, the ordinary kind.
+  app->timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+  if (!app->timer) app->timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
   registerClasses();
   app->taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
@@ -1717,6 +1961,7 @@ int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir
   UnregisterHotKey(app->host, HOTKEY_QUIT);
   UnregisterHotKey(app->host, HOTKEY_SPOT);
   if (app->host) DestroyWindow(app->host);
+  if (app->timer) CloseHandle(app->timer);
   CoUninitialize();
   if (once) CloseHandle(once);
   app = nullptr;

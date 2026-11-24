@@ -18,7 +18,8 @@
 //                                      window enters the image
 //   Sunbeam.exe --probe <folder> [s]   attaches to the desktop briefly and
 //                                      writes down whether everything is in
-//                                      place
+//                                      place; with "blind" after the seconds
+//                                      nothing appears, the loop runs unseen
 //   Sunbeam.exe --weather <folder> [place]
 //                                      looks the place up (a name or
 //                                      coordinates), fetches its weather once
@@ -33,6 +34,7 @@
 
 #include "app.h"
 #include "check.h"
+#include "motion.h"
 #include "scene.h"
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
@@ -43,6 +45,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   std::vector<std::wstring> args(argv, argv + argc);
   LocalFree(argv);
+
+  // A check run does not take the graphics card from what the user is doing: it
+  // only gets what other programs leave. Timings are then only valid while the
+  // card is free; with the environment variable SUNBEAM_FULL set, the run takes
+  // its normal share.
+  wchar_t full[8];
+  if (args.size() >= 2 && args[1].rfind(L"--", 0) == 0 && !GetEnvironmentVariableW(L"SUNBEAM_FULL", full, 8)) standAside(true);
 
   if (args.size() >= 3 && args[1] == L"--check") {
     int w = args.size() >= 6 ? _wtoi(args[3].c_str()) : 2560;
@@ -81,8 +90,18 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     float y = args.size() >= 5 ? float(_wtof(args[4].c_str())) : 0.6f;
     return runReal(args[2], x, y);
   }
+  if (args.size() >= 3 && args[1] == L"--drag") {
+    float x = args.size() >= 5 ? float(_wtof(args[3].c_str())) : 0.5f;
+    float y = args.size() >= 5 ? float(_wtof(args[4].c_str())) : 0.3f;
+    return runDrag(args[2], x, y);
+  }
+  if (args.size() >= 3 && args[1] == L"--pace") {
+    float x = args.size() >= 5 ? float(_wtof(args[3].c_str())) : 0.5f;
+    float y = args.size() >= 5 ? float(_wtof(args[4].c_str())) : 0.3f;
+    return runPace(args[2], x, y);
+  }
   if (args.size() >= 3 && args[1] == L"--probe") {
-    return runApp(instance, args.size() >= 4 ? _wtof(args[3].c_str()) : 3.0, args[2]);
+    return runApp(instance, args.size() >= 4 ? _wtof(args[3].c_str()) : 3.0, args[2], args.size() >= 5 && args[4] == L"blind");
   }
   return runApp(instance);
 }

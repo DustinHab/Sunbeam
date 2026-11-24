@@ -49,11 +49,14 @@ windows.
   passes.
 - **Light**: a click-through layer above all windows adds scattered light and
   shadows, rim light on window edges and dust. HDR displays are supported.
+  The light stays on a window while it is dragged, and on the mouse pointer:
+  their positions are read a thousand times a second and computed ahead to
+  the display refresh in which the frame appears.
 - **Live weather** (optional) sets clouds, rain or snow, thunderstorms, wind,
   fog and temperature from the current weather at your place.
 
 Sunbeam rests while a full-screen application or a maximized window covers the
-desktop.
+desktop, and leaves the graphics card to it.
 
 ## Requirements
 
@@ -62,8 +65,19 @@ Windows 11 and a Direct3D 11 graphics card. Developed and tested on Windows 11
 RTX 4070; other setups are untested. Only the primary display is used.
 
 The program renders continuously while the desktop is visible. On the
-development machine a full frame takes about 5 ms at 3840 x 2160, an
-intermediate frame that only redraws the water about 2 ms.
+development machine, at 3840 x 2160, a full frame takes about 4 ms with the
+default settings and about 6 ms with the scattered light at its highest
+(resolution 100 %, 128 steps). While a window is dragged a frame is made for
+every display refresh: at the highest settings the light takes about 2.5 ms
+of it, and the sky moves on in pieces of about 1 ms in between.
+
+How that is done: a window only shadows haze in front of it. Everything else
+the scattered light depends on (clouds, mountains, icons, mist) is summed
+without the windows, the haze in front of the rearmost window on a coarse
+grid in depth, the haze behind it per pixel. A moving window then only costs
+a step that removes what it shadows from these sums, at the two edges of its
+shadow along each line of sight. `--drag` compares the result with the direct
+march through the haze, which stays in the program for that purpose.
 
 ## Build
 
@@ -130,10 +144,16 @@ measurements:
 | `Sunbeam.exe --life <folder>` | Lets two days pass per ground and writes down how often ships, aircraft and birds appeared and for how long. |
 | `Sunbeam.exe --weather <folder> [place]` | Looks a place up, fetches its weather once and writes down the resulting slider positions. |
 | `Sunbeam.exe --scene <file>` | Lists window classes and positions on the desktop (no titles). |
-| `Sunbeam.exe --probe <folder> [seconds]` | Runs the real loop on the desktop for a few seconds without a tray icon and logs. |
+| `Sunbeam.exe --drag <folder> [x y]` | Measures what a frame costs at rest and while a window is dragged, part by part, and compares the scattered light with the direct march through the haze (difference images). `quick.txt` in the folder: timings only; `compare.txt`: comparison only. |
+| `Sunbeam.exe --pace <folder> [x y]` | Simulates a pointer and a window that follows it, makes a frame for every display refresh and writes down how far the light was from the window when the frame appeared. |
+| `Sunbeam.exe --probe <folder> [seconds] [blind]` | Runs the real loop on the desktop for a few seconds without a tray icon and logs. With `blind` nothing appears on the screen. |
 
 The formats of the input files are described at the functions in
-`src\check.cpp`.
+`src\check.cpp`. Check runs only take what other programs leave of the
+graphics card, so timings are only valid while the card is free; with the
+environment variable `SUNBEAM_FULL` set they take their normal share. With
+`SUNBEAM_ADAPTER` set to part of the name of a graphics card, they run on that
+card.
 
 ## Source
 
@@ -142,6 +162,7 @@ The formats of the input files are described at the functions in
 | `src\app.cpp` | Windows on the desktop, main loop, settings, tray icon |
 | `src\render.cpp` | Renderer: passes, timing, sea state, lightning |
 | `src\scene.cpp` | Reads windows, taskbar and icons |
+| `src\motion.cpp` | Follows the pointer and a dragged window and computes ahead where they will be; pace of the display |
 | `src\panel.cpp` | Settings window (Direct2D) |
 | `src\astro.cpp`, `src\daycycle.cpp` | Positions of sun and moon and their place in the image |
 | `src\weather.cpp`, `src\place.cpp`, `src\net.cpp` | Live weather, place search, HTTPS |
@@ -156,6 +177,10 @@ The formats of the input files are described at the functions in
 ## Limits
 
 - One display; no reaction to a lost graphics device.
+- The position of a dragged window is computed ahead from the mouse pointer.
+  A window that does not follow the pointer in a steady way, or that moves
+  without the mouse, is taken as last read: the light is then up to one
+  refresh behind it.
 - Wind direction is fixed; live weather sets only its strength.
 - No sound.
 - Snow lies on the land but does not pile up on ships or freeze the water; the

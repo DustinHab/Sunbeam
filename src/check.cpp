@@ -11,7 +11,9 @@
 #include <dxgi1_4.h>
 #include <dxgi1_5.h>
 #include <wincodec.h>
+#include <winternl.h>
 #include <wrl/client.h>
+#include <d3dkmthk.h>
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +26,7 @@
 
 #include "astro.h"
 #include "daycycle.h"
+#include "motion.h"
 #include "panel.h"
 #include "place.h"
 #include "weather.h"
@@ -255,12 +258,17 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
               {"Stars", &Params::stars},        {"Moonlight", &Params::moonlight},   {"HdrGlow", &Params::glow},
               {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground},
               {"Life", &Params::life},         {"Fog", &Params::fog},          {"Temperature", &Params::temperature},
-              {"DayTemperature", &Params::dayTemperature}, {"SnowDepth", &Params::snowDepth}};
+              {"DayTemperature", &Params::dayTemperature}, {"SnowDepth", &Params::snowDepth}, {"Pointer", &Params::pointer},
+              {"Resolution", &Params::resolution}};
   char key[64];
   float v;
   bool day = false;
   while (fscanf_s(in, "%63s %f", key, unsigned(sizeof(key)), &v) == 2) {
     if (!strcmp(key, "Shift")) shift = v;
+    if (!strcmp(key, "Steps")) {
+      p.steps = int(v);
+      fprintf(log, "  %s = %g\n", key, v);
+    }
     day |= !strcmp(key, "DayTemperature");
     for (const auto& k : keys) {
       if (!strcmp(key, k.key)) {
@@ -273,6 +281,56 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
   if (!day) p.dayTemperature = p.temperature;
   fclose(in);
   return true;
+}
+
+// The graphics card a check runs on: the default one, or, if the environment
+// variable SUNBEAM_ADAPTER is set, the one whose name contains its value. A
+// check of the images can then run on a second card while the first is busy.
+HRESULT makeDevice(ComPtr<ID3D11Device>& dev, ComPtr<ID3D11DeviceContext>& ctx) {
+  D3D_FEATURE_LEVEL level;
+  wchar_t want[128] = L"";
+  ComPtr<IDXGIFactory1> factory;
+  if (GetEnvironmentVariableW(L"SUNBEAM_ADAPTER", want, 128) > 0 && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++) {
+      DXGI_ADAPTER_DESC1 d = {};
+      adapter->GetDesc1(&d);
+      if (wcsstr(d.Description, want)) {
+        return D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                 &level, &ctx);
+      }
+    }
+  }
+  return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &dev, &level,
+                           &ctx);
+}
+
+// The time the graphics card has worked for this process so far, in
+// milliseconds, as Windows accounts it. Unlike a stopwatch it does not include
+// the time other programs held the card. Negative if it cannot be read.
+double cardTime(ID3D11Device* dev) {
+  ComPtr<IDXGIDevice> dxgi;
+  ComPtr<IDXGIAdapter> adapter;
+  DXGI_ADAPTER_DESC desc = {};
+  if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc))) return -1;
+  D3DKMT_QUERYSTATISTICS qs = {};
+  qs.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
+  qs.AdapterLuid = desc.AdapterLuid;
+  if (D3DKMTQueryStatistics(&qs) != 0) return -1;
+  ULONG nodes = qs.QueryResult.AdapterInformation.NodeCount;
+  HANDLE self = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, GetCurrentProcessId());
+  if (!self) return -1;
+  double sum = 0;
+  for (ULONG i = 0; i < nodes; i++) {
+    qs = {};
+    qs.Type = D3DKMT_QUERYSTATISTICS_PROCESS_NODE;
+    qs.AdapterLuid = desc.AdapterLuid;
+    qs.hProcess = self;
+    qs.QueryProcessNode.NodeId = i;
+    if (D3DKMTQueryStatistics(&qs) == 0) sum += double(qs.QueryResult.ProcessNodeInformation.RunningTime.QuadPart) / 1e4;
+  }
+  CloseHandle(self);
+  return sum;
 }
 
 }  // namespace
@@ -359,9 +417,7 @@ int runCheck(const std::wstring& dir, int viewW, int viewH, float scale) {
 
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
-  D3D_FEATURE_LEVEL level;
-  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, &level, &ctx))) {
+  if (FAILED(makeDevice(dev, ctx))) {
     fprintf(log, "no Direct3D device\n");
     fclose(log);
     return 3;
@@ -612,11 +668,8 @@ int runReal(const std::wstring& dir, float sunX, float sunY) {
 
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
-  D3D_FEATURE_LEVEL level;
   Renderer r;
-  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, &level, &ctx)) ||
-      !r.init(dev.Get(), ctx.Get())) {
+  if (FAILED(makeDevice(dev, ctx)) || !r.init(dev.Get(), ctx.Get())) {
     fprintf(log, "no Direct3D device\n");
     fclose(log);
     return 3;
@@ -726,6 +779,484 @@ int runReal(const std::wstring& dir, float sunX, float sunY) {
   return ok ? 0 : 5;
 }
 
+// What a frame costs while a window is dragged, and what it costs at rest: time
+// per part of the frame on the surface of the real display, with the light in
+// the format of an HDR display. Then the scattered light from the sums of the
+// haze against the direct march through it: the same image must come out. The
+// layout is simulated: four windows (one translucent), a taskbar, six icons.
+// values.txt in the folder sets the sliders; the sun position decides which of
+// the windows covers the sun.
+int runDrag(const std::wstring& dir, float sunX, float sunY) {
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  CreateDirectoryW(dir.c_str(), nullptr);
+  FILE* log = nullptr;
+  _wfopen_s(&log, (dir + L"\\drag.txt").c_str(), L"w");
+  if (!log) return 2;
+
+  ComPtr<ID3D11Device> dev;
+  ComPtr<ID3D11DeviceContext> ctx;
+  Renderer r;
+  if (FAILED(makeDevice(dev, ctx)) || !r.init(dev.Get(), ctx.Get())) {
+    fprintf(log, "no Direct3D device\n");
+    fclose(log);
+    return 3;
+  }
+  r.stage({});
+  Monitor m = primaryMonitor();
+  int pw = m.width(), ph = m.height();
+  float scale = m.scale, vw = pw / scale, vh = ph / scale;
+  r.resize(pw, ph, scale);
+  {
+    Params p;
+    double shift = -1;
+    if (readValues(dir, log, p, shift)) r.setParams(p);
+    if (shift >= 0) r.seek(shift);
+  }
+  r.setOutput(true, 3.0f);
+
+  const float bar = 48;
+  std::vector<Occluder> scene = {
+      {0.08f * vw, 0.10f * vh, 0.40f * vw, 0.52f * vh, 8, 1, 1, 101},
+      {0.46f * vw, 0.30f * vh, 0.86f * vw, 0.78f * vh, 8, 1, 1, 102},
+      {0.20f * vw, 0.58f * vh, 0.44f * vw, 0.90f * vh, 8, 1, 1, 103},
+      {0.62f * vw, 0.06f * vh, 0.84f * vw, 0.26f * vh, 8, 0.8f, 1, 104},
+      {0, vh - bar, vw, vh, 0, 0.88f, 2, 105},
+  };
+  r.setScene(scene, sunX * vw, sunY * vh);
+  std::vector<uint8_t> mask(size_t(pw) * ph, 0);
+  for (int i = 0; i < 6; i++) {
+    const float box[2][4] = {{22, 15 + i * 96.0f, 48, 48}, {18, 70 + i * 96.0f, 56, 12}};
+    for (const auto& b : box) {
+      int x0 = int(b[0] * scale), y0 = int(b[1] * scale), x1 = int((b[0] + b[2]) * scale), y1 = int((b[1] + b[3]) * scale);
+      for (int y = y0; y < y1 && y < ph; y++) memset(&mask[size_t(y) * pw + x0], 255, size_t(x1 - x0));
+    }
+  }
+  r.setIconMask(mask.data(), pw, ph);
+
+  Offscreen skyOut = makeOffscreen(dev.Get(), pw, ph), lightOut = makeOffscreen(dev.Get(), pw, ph, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  for (int i = 0; i < 120; i++) r.render(1.0 / 60, skyOut.rtv.Get(), lightOut.rtv.Get());
+  for (int i = 0; i < 300; i++) r.render(1.0 / 20, skyOut.rtv.Get(), lightOut.rtv.Get());
+  r.sync();
+  fprintf(log, "Surface %d x %d device pixels, scale %.2f, sun at %.0f %.0f\n", pw, ph, scale, sunX * vw, sunY * vh);
+
+  // One series: frames at the pace of a display with 240 Hz. moving: the second
+  // window travels 8 logical pixels per frame, back and forth.
+  // period: the frames are made in a rush, as for a display with this much time
+  // between two refreshes.
+  auto series = [&](const char* name, bool moving, int frames, double period = 0) {
+    std::vector<Occluder> now = scene;
+    std::vector<Renderer::Part> parts;
+    std::vector<double> took, lightTook;
+    float at = 0, step = 8;
+    double card = 0, cpu = 0;
+    // Whole frames first, as the graphics card sees them, then part by part.
+    for (int pass = 0; pass < 2; pass++) {
+      r.profile(pass ? &parts : nullptr);
+      r.sync();
+      double before = cardTime(dev.Get());
+      for (int i = 0; i < frames; i++) {
+        if (!moving && period > 0) {
+          at += step;
+          if (at > 400 || at < 0) step = -step;
+          r.setCursor(true, 600 + at, 500 + at * 0.4f, 600 + at + 50, 500 + at * 0.4f + 50, 1);
+        }
+        if (moving) {
+          at += step;
+          if (at > 400 || at < 0) step = -step;
+          now[1].x0 = scene[1].x0 - at, now[1].x1 = scene[1].x1 - at;
+          now[1].y0 = scene[1].y0 - at * 0.3f, now[1].y1 = scene[1].y1 - at * 0.3f;
+          r.setScene(now);
+        }
+        auto a = Clock::now();
+        r.render(1.0 / 240, skyOut.rtv.Get(), lightOut.rtv.Get(), period);
+        if (period > 0) {
+          // The light alone counts for the pace; the pieces of the sky follow it.
+          r.sync();
+          if (!pass) lightTook.push_back(ms(a, Clock::now()));
+          r.after(skyOut.rtv.Get(), period - 0.003);
+        }
+        auto b = Clock::now();
+        r.sync();
+        if (!pass) took.push_back(ms(a, Clock::now())), cpu += ms(a, b);
+      }
+      if (!pass) card = (cardTime(dev.Get()) - before) / frames;
+    }
+    fprintf(log, "%s: the program itself needs %.3f ms per frame to issue it\n", name, cpu / frames);
+    r.profile(nullptr);
+    r.setCursor(false, 0, 0, 0, 0, 1);
+    std::sort(took.begin(), took.end());
+    double sum = 0, marked = 0;
+    for (double t : took) sum += t;
+    for (const Renderer::Part& p : parts) marked += p.ms / frames;
+    fprintf(log, "%s: the card works %.2f ms per frame (%.2f ms between its marks); by the stopwatch mean %.2f ms, median %.2f ms, 95 %% below %.2f ms, longest %.2f ms\n", name,
+            card, marked, sum / took.size(), took[took.size() / 2], took[took.size() * 95 / 100], took.back());
+    // The parts by the marks of the card, scaled to the time it really worked: the
+    // marks also count the moments in which another program held the card.
+    if (!lightTook.empty()) {
+      std::sort(lightTook.begin(), lightTook.end());
+      fprintf(log, "%s: the light alone by the stopwatch median %.2f ms, 95 %% below %.2f ms, longest %.2f ms\n", name, lightTook[lightTook.size() / 2],
+              lightTook[lightTook.size() * 95 / 100], lightTook.back());
+    }
+    for (const Renderer::Part& p : parts) {
+      fprintf(log, "    %-16s %7.3f ms per frame (%.3f between marks)\n", p.name, p.ms / frames * (card > 0 && marked > 0 ? card / marked : 1), p.ms / frames);
+    }
+    r.setScene(scene);
+    fflush(log);
+  };
+  // quick.txt in the folder: only the timings of the new way. compare.txt: only
+  // the comparison of the images.
+  auto has = [&](const wchar_t* name) { return GetFileAttributesW((dir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES; };
+  bool quick = has(L"quick.txt"), only = has(L"compare.txt");
+  if (!only) {
+    series("At rest", false, 240);
+    series("Dragging a window", true, 240);
+    series("Dragging a window, in a rush", true, 480, 1.0 / 240);
+    series("Pointer moving, in a rush", false, 480, 1.0 / 240);
+  }
+  if (!only && !quick) {
+    r.setReference(true);
+    series("At rest, direct march", false, 120);
+    series("Dragging a window, direct march", true, 120);
+    r.setReference(false);
+  }
+
+  // The scattered light from the sums against the direct march: the same moment
+  // (no time passes), composed as on the desktop, difference in levels of 255.
+  // settled: averaged over many frames. single: the one frame right after a
+  // window has moved, against the settled direct march at that position.
+  // Four times, five seconds apart: how close the two are depends on where the
+  // clouds stand.
+  for (int moment = 0; moment < (quick ? 0 : 4); moment++) {
+    for (int i = 0; i < 75; i++) r.render(1.0 / 15, skyOut.rtv.Get(), lightOut.rtv.Get());
+    fprintf(log, "Moment %d\n", moment + 1);
+    fflush(log);
+    const float white = 3.0f;
+    auto shot = [&](bool reference, int frames) {
+      r.setReference(reference);
+      for (int i = 0; i < frames; i++) r.render(0, skyOut.rtv.Get(), lightOut.rtv.Get());
+      r.sync();
+      Image sky = readBack(ctx.Get(), skyOut, pw, ph);
+      std::vector<float> light = readBackWide(ctx.Get(), lightOut, pw, ph);
+      return composeLinear(sky, light, white, scene, mask, scale, 1);
+    };
+    auto compare = [&](const char* name, const Image& a, const Image& b, const wchar_t* file) {
+      wchar_t numbered[64] = L"";
+      if (file) swprintf_s(numbered, L"%s%d.png", file, moment + 1);
+      std::vector<int> hist(256, 0);
+      double sum = 0;
+      Image diff = a;
+      for (size_t i = 0; i < a.px.size(); i += 4) {
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+          int d = std::abs(int(a.px[i + c]) - int(b.px[i + c]));
+          sum += d;
+          worst = std::max(worst, d);
+          diff.px[i + c] = uint8_t(std::min(255, d * 24));
+        }
+        hist[worst]++;
+      }
+      size_t n = a.px.size() / 4, over1 = 0, over2 = 0, over4 = 0;
+      int most = 0;
+      for (int v = 0; v < 256; v++) {
+        if (hist[v]) most = v;
+        if (v > 1) over1 += hist[v];
+        if (v > 2) over2 += hist[v];
+        if (v > 4) over4 += hist[v];
+      }
+      fprintf(log, "%s: mean difference %.3f, largest %d; pixels off by more than 1: %.3f %%, more than 2: %.4f %%, more than 4: %.4f %%\n", name,
+              sum / (3.0 * n), most, 100.0 * over1 / n, 100.0 * over2 / n, 100.0 * over4 / n);
+      if (file) savePng(dir + L"\\" + numbered, shrink(diff, 2));
+      fflush(log);
+    };
+    Image direct = shot(true, 40), sums = shot(false, 40);
+    compare("Settled, sums against direct march", sums, direct, L"settled_difference");
+    if (moment == 0) {
+      savePng(dir + L"\\settled_direct.png", shrink(direct, 2));
+      savePng(dir + L"\\settled_sums.png", shrink(sums, 2));
+    }
+    // The direct march against itself after more frames: what two runs of the same
+    // computation differ by.
+    Image again = shot(true, 20);
+    compare("Settled, direct march against itself", again, direct, nullptr);
+
+    std::vector<Occluder> moved = scene;
+    moved[1].x0 -= 60, moved[1].x1 -= 60, moved[1].y0 -= 24, moved[1].y1 -= 24;
+    // The window has just been moved in every image that is compared: back to
+    // where it was and there again, so that the margin around its edges is the
+    // same in all of them.
+    std::swap(scene, moved);
+    r.setScene(scene);
+    r.render(0, skyOut.rtv.Get(), lightOut.rtv.Get());
+    std::swap(scene, moved);
+    r.setScene(scene);
+    r.render(0, skyOut.rtv.Get(), lightOut.rtv.Get());
+    std::swap(scene, moved);
+    r.setScene(scene);
+    Image there = shot(true, 40);
+    auto single = [&](bool reference) {
+      std::swap(scene, moved);
+      r.setScene(scene);
+      r.setReference(reference);
+      for (int i = 0; i < 24; i++) r.render(0, skyOut.rtv.Get(), lightOut.rtv.Get());
+      std::swap(scene, moved);
+      r.setScene(scene);
+      return shot(reference, 1);
+    };
+    Image oneDirect = single(true), oneSums = single(false);
+    compare("Single frame after a move, direct march", oneDirect, there, L"single_direct_difference");
+    compare("Single frame after a move, sums", oneSums, there, L"single_sums_difference");
+    if (moment == 0) savePng(dir + L"\\single_sums.png", shrink(oneSums, 2));
+    std::swap(scene, moved);
+    r.setScene(scene);
+    r.setReference(false);
+  }
+
+  // Reading the positions of all windows from Windows.
+  {
+    std::vector<double> took;
+    for (int i = 0; i < 200; i++) {
+      auto a = Clock::now();
+      Scene s = captureScene(m, {});
+      took.push_back(ms(a, Clock::now()));
+    }
+    std::sort(took.begin(), took.end());
+    fprintf(log, "Reading all windows: median %.3f ms, longest %.3f ms\n", took[took.size() / 2], took.back());
+  }
+  fclose(log);
+  return 0;
+}
+
+// A desktop that exists only in the computation: a pointer on a winding path
+// with up to 3800 pixels per second, and a window that follows it the way a
+// program moves its window, a little behind and in steps.
+class Staged : public MotionSource {
+ public:
+  double delay = 0.001, step = 0.001;   // seconds the window is behind the pointer, and between two of its moves
+  // The steps hang on the refreshes of the display: one per refresh, `phase`
+  // seconds after it (base and period as in Beat). Negative phase: they do not.
+  double phase = -1, base = 0, period = 1.0 / 60;
+  Staged() {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    freq_ = double(f.QuadPart);
+    start_ = now();
+  }
+  double now() override {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return double(c.QuadPart) / freq_;
+  }
+  POINT path(double t) const {
+    double s = t - start_;
+    return {LONG(std::lround(1900 + 1300 * std::sin(1.9 * s) + 250 * std::sin(5.3 * s + 1))),
+            LONG(std::lround(1000 + 500 * std::sin(1.3 * s + 0.5) + 120 * std::sin(4.1 * s)))};
+  }
+  // The frame of the window at time t: the program applied the pointer position
+  // of `delay` ago at the last of its steps.
+  RECT truth(double t) const {
+    double applied = phase >= 0 ? base + phase + std::floor((t - base - phase) / period) * period : step > 0 ? std::floor(t / step) * step : t;
+    POINT c = path(applied - delay);
+    return {c.x - 300, c.y - 20, c.x + 900, c.y + 700};
+  }
+  bool pointer(POINT& at, bool& held) override {
+    at = path(now());
+    held = true;
+    return true;
+  }
+  HWND dragged(bool) override { return window(); }
+  bool frame(HWND, RECT& frame) override {
+    frame = truth(now());
+    return true;
+  }
+  static HWND window() { return reinterpret_cast<HWND>(uintptr_t(0x5151)); }
+
+ private:
+  double freq_ = 1, start_ = 0;
+};
+
+// How far the light is from a dragged window when the frame appears. Nothing is
+// shown: the window and the pointer are simulated, the frames are made for the
+// real surface at the real pace of the display, and what they were made for is
+// compared with where the window was at the refresh that would have shown them.
+// The new way (a frame per refresh, started late, positions computed ahead)
+// against the positions as last read, and against the way before: the direct
+// march through the haze, a frame after the other.
+int runPace(const std::wstring& dir, float sunX, float sunY) {
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  CreateDirectoryW(dir.c_str(), nullptr);
+  FILE* log = nullptr;
+  _wfopen_s(&log, (dir + L"\\pace.txt").c_str(), L"w");
+  if (!log) return 2;
+
+  ComPtr<ID3D11Device> dev;
+  ComPtr<ID3D11DeviceContext> ctx;
+  Renderer r;
+  if (FAILED(makeDevice(dev, ctx)) || !r.init(dev.Get(), ctx.Get())) {
+    fprintf(log, "no Direct3D device\n");
+    fclose(log);
+    return 3;
+  }
+  r.stage({});
+  Monitor m = primaryMonitor();
+  int pw = m.width(), ph = m.height();
+  float scale = m.scale, vw = pw / scale, vh = ph / scale;
+  r.resize(pw, ph, scale);
+  {
+    Params p;
+    double shift = -1;
+    if (readValues(dir, log, p, shift)) r.setParams(p);
+    if (shift >= 0) r.seek(shift);
+  }
+  r.setOutput(true, 3.0f);
+
+  Staged stage;
+  uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(Staged::window()));
+  auto occluder = [&](const RECT& f) { return Occluder{f.left / scale, f.top / scale, f.right / scale, f.bottom / scale, 8, 1, 1, id}; };
+  const float bar = 48;
+  std::vector<Occluder> scene = {
+      {0.08f * vw, 0.10f * vh, 0.40f * vw, 0.52f * vh, 8, 1, 1, 101},
+      {0.20f * vw, 0.58f * vh, 0.44f * vw, 0.90f * vh, 8, 1, 1, 103},
+      occluder(stage.truth(stage.now())),
+      {0, vh - bar, vw, vh, 0, 0.88f, 2, 105},
+  };
+  r.setScene(scene, sunX * vw, sunY * vh);
+  std::vector<uint8_t> mask(size_t(pw) * ph, 0);
+  r.setIconMask(mask.data(), pw, ph);
+  Offscreen skyOut = makeOffscreen(dev.Get(), pw, ph), lightOut = makeOffscreen(dev.Get(), pw, ph, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  for (int i = 0; i < 120; i++) r.render(1.0 / 60, skyOut.rtv.Get(), lightOut.rtv.Get());
+  for (int i = 0; i < 300; i++) r.render(1.0 / 20, skyOut.rtv.Get(), lightOut.rtv.Get());
+  r.sync();
+
+  Beat beat;
+  beat.update(stage.now());
+  // nodraw.txt in the folder: no frame is made, each counts as finished after two
+  // milliseconds. What remains is the computing ahead alone.
+  bool draw = GetFileAttributesW((dir + L"\\nodraw.txt").c_str()) == INVALID_FILE_ATTRIBUTES;
+  fprintf(log, "Surface %d x %d device pixels, display at %.1f Hz%s\n", pw, ph, 1 / beat.period, draw ? "" : ", no frames made");
+  Snooze snooze;
+  auto until = [&](double when) { snooze.until(when); };
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  auto off = [](const RECT& a, const RECT& b) {
+    return double(std::max(std::max(std::abs(a.left - b.left), std::abs(a.top - b.top)), std::max(std::abs(a.right - b.right), std::abs(a.bottom - b.bottom))));
+  };
+  auto report = [&](const char* name, std::vector<double>& e) {
+    if (e.empty()) return;
+    std::sort(e.begin(), e.end());
+    double sum = 0;
+    for (double v : e) sum += v;
+    fprintf(log, "    %-34s off by %5.1f px on average, half below %5.1f, 95 %% below %5.1f, at most %5.1f\n", name, sum / e.size(), e[e.size() / 2],
+            e[e.size() * 95 / 100], e.back());
+  };
+
+  // Delay, step, and for steps that hang on the refreshes how long after one they
+  // come (otherwise negative).
+  const double programs[6][3] = {{0.001, 0.001, -1}, {0.003, 0.0045, -1}, {0.002, 0.0073, -1}, {0.010, 0.0137, -1}, {0.002, 0, 0.001}, {0.002, 0, 0.75}};
+  for (const auto& program : programs) {
+    stage.delay = program[0], stage.step = program[1];
+    stage.base = beat.base, stage.period = beat.period;
+    stage.phase = program[2] < 0 ? -1 : program[2] < 0.5 ? program[2] : program[2] * beat.period;
+    if (stage.phase < 0) {
+      fprintf(log, "A program that moves its window every %.1f ms, %.0f ms behind the pointer\n", stage.step * 1000, stage.delay * 1000);
+    } else {
+      fprintf(log, "A program that moves its window once per refresh, %.1f ms after it, %.0f ms behind the pointer\n", stage.phase * 1000, stage.delay * 1000);
+    }
+    Motion motion;
+    motion.start(&stage);
+    motion.enable(true);
+    Sleep(400);
+
+    // The new way.
+    {
+      Lead lead;
+      std::vector<double> ahead, read, spans;
+      int frames = 0, late = 0, led = 0, overslept = 0;
+      double leadSum = 0, last = stage.now();
+      for (int i = 0; i < 1200; i++) {
+        double t, latch;
+        do {
+          t = stage.now();
+          beat.update(t);
+          latch = beat.next(t + lead.value - Lead::SLACK);
+          snooze.until(latch - lead.value, 0.0005);
+          t = stage.now();
+          overslept += latch - t < lead.value - Lead::SLACK - 0.00005;
+        } while (latch - t < lead.value - Lead::SLACK - 0.00005);
+        Motion::Guess g = motion.guess(latch, latch + beat.period);
+        RECT seen = stage.truth(t);
+        scene[2] = occluder(g.window ? g.frame : seen);
+        r.setScene(scene, g.led ? 0.002f : 0.007f);
+        r.setCursor(true, g.pointer.x / scale, g.pointer.y / scale, g.pointer.x / scale + 50, g.pointer.y / scale + 50, 1);
+        if (draw) {
+          r.render(t - last, skyOut.rtv.Get(), lightOut.rtv.Get(), beat.period);
+          r.submit();
+          r.after(skyOut.rtv.Get(), beat.period - lead.value - 0.0005);
+        }
+        last = t;
+        double took = -1;
+        for (;;) {
+          double n = stage.now();
+          if (draw ? r.finished() : n - t >= 0.002) {
+            took = n - t;
+            break;
+          }
+          if (n >= latch - Lead::ROOM) break;
+          until(std::min(n + 0.0003, latch - Lead::ROOM));
+        }
+        bool done = took >= 0;
+        lead.judge(took, beat.period);
+        if (done) spans.push_back(took * 1000);
+        if (i < 240) continue;   // the lead has to find its length first
+        frames++;
+        late += !done;
+        led += g.led;
+        leadSum += lead.value;
+        // A frame that was not finished appears one refresh later.
+        RECT shown = stage.truth(done ? latch : latch + beat.period);
+        ahead.push_back(off(g.window ? g.frame : seen, shown));
+        read.push_back(off(seen, shown));
+      }
+      fprintf(log, "  A frame per refresh: %d frames, %d not finished in time, %d refreshes missed by waking late, started %.2f ms ahead, position computed ahead in %d %% of them\n",
+              frames, late, overslept, leadSum / frames * 1000, 100 * led / frames);
+      Motion::Model mo = motion.model();
+      fprintf(log, "    measured: window %.0f ms behind the pointer, moves every %.1f ms, strays by %.1f px\n", mo.delay * 1000, mo.step * 1000, mo.spread);
+      std::sort(spans.begin(), spans.end());
+      if (!spans.empty()) {
+        fprintf(log, "    the card was through with the light after %.2f ms (half of the frames), %.2f ms (95 %%), %.2f ms at most\n", spans[spans.size() / 2],
+                spans[spans.size() * 95 / 100], spans.back());
+      }
+      report("positions computed ahead:", ahead);
+      report("positions as last read:", read);
+    }
+    motion.stop();
+
+    // The way before: every frame the whole scattered light by the direct march,
+    // one frame after the other, each shown at the first refresh after the card is
+    // through with it.
+    if (draw) {
+      r.setReference(true);
+      std::vector<double> before;
+      double last = stage.now();
+      for (int i = 0; i < 200; i++) {
+        double t = stage.now();
+        RECT seen = stage.truth(t);
+        scene[2] = occluder(seen);
+        r.setScene(scene);
+        r.render(t - last, skyOut.rtv.Get(), lightOut.rtv.Get());
+        last = t;
+        r.sync();
+        if (i < 20) continue;
+        before.push_back(off(seen, stage.truth(beat.next(stage.now()))));
+      }
+      r.setReference(false);
+      report("the way before:", before);
+    }
+  }
+  fclose(log);
+  return 0;
+}
+
 // The sky over the day: renders the image of an empty desktop for a series of
 // times or of sun positions set by hand. The folder may contain a cases.txt,
 // with one of these per line
@@ -746,11 +1277,8 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
   if (!log) return 2;
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
-  D3D_FEATURE_LEVEL level;
   Renderer r;
-  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, &level, &ctx)) ||
-      !r.init(dev.Get(), ctx.Get())) {
+  if (FAILED(makeDevice(dev, ctx)) || !r.init(dev.Get(), ctx.Get())) {
     fprintf(log, "no Direct3D device\n");
     fclose(log);
     return 3;
@@ -1111,11 +1639,8 @@ int runDrift(const std::wstring& dir, int viewW, int viewH, float scale) {
   if (!log) return 2;
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
-  D3D_FEATURE_LEVEL level;
   Renderer moving, still;
-  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, &level, &ctx)) ||
-      !moving.init(dev.Get(), ctx.Get()) || !still.init(dev.Get(), ctx.Get())) {
+  if (FAILED(makeDevice(dev, ctx)) || !moving.init(dev.Get(), ctx.Get()) || !still.init(dev.Get(), ctx.Get())) {
     fclose(log);
     return 3;
   }
@@ -1238,11 +1763,8 @@ int runPanelCheck(const std::wstring& dir) {
   CreateDirectoryW(dir.c_str(), nullptr);
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
-  D3D_FEATURE_LEVEL level;
   Renderer r;
-  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, &level, &ctx)) ||
-      !r.init(dev.Get(), ctx.Get())) {
+  if (FAILED(makeDevice(dev, ctx)) || !r.init(dev.Get(), ctx.Get())) {
     return 3;
   }
   r.stage({});

@@ -7,9 +7,16 @@
 //      mountains and sun is made, once at full sharpness for the eye and once
 //      at half size as a texture for shadows and glare.
 //   2. Glare: visible sky, blurred in levels.
-//   3. Scattered light: view ray through the haze, averaged over several
-//      frames.
+//   3. Scattered light: the haze along every view ray, averaged over several
+//      frames. A window only shadows haze in front of it, so the haze is summed
+//      without the windows (in front of the rearmost window on a coarse grid in
+//      depth, behind it per pixel), and a last step removes from these sums
+//      what the windows shadow. Only that step runs anew when a window moves.
 //   4. Composition: scattered light, glare, rim light, the dust on top.
+//
+// While a window is dragged the light is made for every display refresh and
+// goes first; the sky then moves on in small pieces between two such frames
+// (render with a period, then after).
 
 #pragma once
 #include <d3d11.h>
@@ -97,7 +104,9 @@ class Renderer {
   // Size of the surface in device pixels and scale (device pixels per logical
   // pixel).
   void resize(int pixelW, int pixelH, float scale);
-  void setScene(const std::vector<Occluder>& list);
+  // lag: the positions are expected to be off by this many seconds of travel
+  // when the frame appears; around a moving edge the light stays off that far.
+  void setScene(const std::vector<Occluder>& list, float lag = 0.014f);
   // Sun and moon. gentle: they have moved on a bit by themselves, the image
   // follows gradually; otherwise it counts as a user change and is recomputed at
   // once.
@@ -139,14 +148,39 @@ class Renderer {
   float snowing() const;
   // One frame, dt seconds after the previous one. Both targets have the size of
   // the surface.
-  Drawn render(double dt, ID3D11RenderTargetView* skyOut, ID3D11RenderTargetView* lightOut);
+  // period: seconds between two display refreshes if a window or the pointer is
+  // moving and the light has to follow with every refresh; 0 otherwise.
+  Drawn render(double dt, ID3D11RenderTargetView* skyOut, ID3D11RenderTargetView* lightOut, double period = 0);
+  // After a frame made with a period, once its light has been handed to
+  // Windows: the sky moves on by as much as fits into the seconds of room
+  // until the next frame has to start. Reports a new sky image if one is
+  // complete.
+  Drawn after(ID3D11RenderTargetView* skyOut, double room);
   // The sky is fully averaged since the last user change.
   bool skySettled() const;
   // Waits until the graphics card has processed everything so far (for
   // measurements).
   void sync();
+  // Hands everything issued so far to the graphics card; finished tells, without
+  // waiting, whether it is through with it.
+  void submit();
+  bool finished();
   // For measurements: a whole sky pass, time per step in milliseconds.
   std::vector<double> timeSteps(ID3D11RenderTargetView* skyOut);
+  // For measurements: from now on every frame adds the time the graphics card
+  // spent on each of its parts to this list, in milliseconds. nullptr ends it.
+  struct Part {
+    const char* name;
+    double ms = 0;
+    int count = 0;
+  };
+  void profile(std::vector<Part>* into);
+  // For comparisons: the scattered light by the direct march through the haze
+  // instead of from its sums. Slow; the image the sums have to match.
+  void setReference(bool on) {
+    if (on != reference_) sceneDirty_ = hazeDirty_ = true;
+    reference_ = on;
+  }
 
   float viewW() const { return viewW_; }
   float viewH() const { return viewH_; }
@@ -254,8 +288,18 @@ class Renderer {
   enum class Into { EYE, LIGHT, MIRROR };
   // What of the image for the eye is made anew.
   enum class Redo { ALL, WATER, NONE };
+  // What a frame of the world leaves for the light.
+  struct World {
+    bool glare = false;     // the sky has moved on, the glare follows
+    bool flowing = false;   // the haze moves by itself
+    bool flick = false;     // there is lightning
+  };
+  // A piece of the world that a rushed frame has left for a later one.
+  enum class Job { FOR_LIGHT, FOR_LIGHT_AND_GLARE, EYE, EYE_AS_IT_IS, HAZE };
 
   Target makeTarget(int w, int h, DXGI_FORMAT format, bool mips);
+  void mark(const char* part);
+  void collect();
   void makeNoise();
   bool loadClouds();
   void bindCommon();
@@ -291,7 +335,13 @@ class Renderer {
   void drawWaterMaps(bool sums, bool shade);
   void faceUpper();
   void faceForLight();
-  void faceForEye(ID3D11RenderTargetView* skyOut, Redo redo = Redo::ALL);
+  bool faceForEye(ID3D11RenderTargetView* skyOut, Redo redo = Redo::ALL, int band = -1);
+  int eyeBands() const;
+  bool hazeSettled() const;
+  bool settling();
+  World drawWorld(ID3D11RenderTargetView* skyOut, bool alive, bool busy, bool defer, Drawn& out);
+  void runJobs(ID3D11RenderTargetView* skyOut, int pieces, Drawn& out);
+  void drawLight(ID3D11RenderTargetView* lightOut, bool busy, bool glare, bool flowing, bool flick, bool rush, Drawn& out);
   bool loadMesh(int model);
   bool allocProps();
   bool updateLife(double dt);
@@ -301,6 +351,12 @@ class Renderer {
   bool stepBand();
   void uploadIcons();
   void drawBloom();
+  void allocVolume();
+  void fillHaze(struct LightC& c);
+  void drawVolume();
+  void drawFar(int band, float share);
+  void drawResolve();
+  void drawHaze(bool flowing);
   void drawScatter();
   void drawComposite(ID3D11RenderTargetView* lightOut);
   void drawFlashLight(ID3D11RenderTargetView* lightOut);
@@ -309,14 +365,15 @@ class Renderer {
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx_;
   Microsoft::WRL::ComPtr<ID3D11VertexShader> vsFull_, vsDust_, vsBolt_, vsBoltFar_, vsProp_;
   Microsoft::WRL::ComPtr<ID3D11PixelShader> psNoise_, psAir_, psNear_, psNearBlock_, psBase_, psHaze_, psFace_, psPick_, psRain_, psShade_, psColumn_, psColumnBlock_, psBolt_, psBoltFar_, psScatter_, psBloomPre_,
-      psBloomDown_, psBloomUp_, psComposite_, psFlash_, psDust_, psProp_, psPropIn_, psLamp_;
+      psBloomDown_, psBloomUp_, psComposite_, psFlash_, psDust_, psProp_, psPropIn_, psLamp_, psFar_, psResolve_;
+  Microsoft::WRL::ComPtr<ID3D11ComputeShader> csVolume_;
   Microsoft::WRL::ComPtr<ID3D11SamplerState> clamp_, wrap_;
   // blendOver_ lays an image over the target by its coverage and reduces what the
   // target holds in a by that much; blendOverKeep_ leaves a as it is.
   Microsoft::WRL::ComPtr<ID3D11BlendState> blendOff_, blendShare_, blendAdd_, blendMax_, blendOver_, blendOverKeep_;
   Microsoft::WRL::ComPtr<ID3D11RasterizerState> raster_, rasterCut_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> skyBuf_, lightBuf_, noiseBuf_;
-  Microsoft::WRL::ComPtr<ID3D11Query> event_;
+  Microsoft::WRL::ComPtr<ID3D11Query> event_, sent_;
   Microsoft::WRL::ComPtr<ID3D11Texture3D> noiseTex_;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> noise_;
   // Textures of the clouds: base shape, fine cells, weather map, turbulence.
@@ -389,6 +446,18 @@ class Renderer {
   Target sky_;      // finished sky at half size with mip levels, for shadows and glare
   Target icons_;    // coverage of the icons
   Target cursor_;   // coverage of the mouse pointer
+  // The haze summed without the windows: in front of the rearmost window on a
+  // coarse grid from the viewer up to each knot, behind it per pixel.
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> vol_;
+  Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> volOut_;
+  int volW_ = 0, volH_ = 0;
+  Target far_;
+  bool hazeDirty_ = true;   // what these sums are made of has changed at a stroke: they start over
+  bool volDue_ = true;      // the clouds have moved on: the sums in front follow
+  double volTime_ = -1e9;   // when they were last made
+  int farBand_ = 0;         // the band of the sums behind that is due next
+  int farCount_[8] = {};    // how often each band has been summed since they started over
+  bool reference_ = false;  // the scattered light by the direct march, for comparisons
   Target scat_[2];  // scattered light, written alternately
   Target scatFlash_[2];   // scattered light of a lightning flash, likewise
   int flashCur_ = 0, flashAccum_ = 0;
@@ -413,6 +482,7 @@ class Renderer {
   bool plateGhost_[32] = {};
   std::vector<Track> tracks_;
   bool sceneSeen_ = false;
+  float lag_ = 0.014f;         // seconds of travel the positions are expected to be off by
   bool linear_ = false;
   float cursorRect_[4] = {0, 0, -1, -1};
   float cursorCalm_ = 1;
@@ -435,6 +505,20 @@ class Renderer {
   double faceTime_ = 0;   // when the image for the eye was last drawn
   Target eye_;            // the image for the eye, persists: between two full frames only the water is made anew in it
   DXGI_FORMAT eyeFormat_ = DXGI_FORMAT_UNKNOWN;
+  std::vector<Part>* parts_ = nullptr;   // where the time of each part of a frame goes, for measurements
+  Microsoft::WRL::ComPtr<ID3D11Query> disjoint_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11Query>> stamps_;   // the marks of the frame being measured
+  std::vector<const char*> stampName_;
+  size_t stampUsed_ = 0;
+  bool stampOpen_ = false;
+  std::vector<Job> jobs_;   // pieces of the world still owed, in order
+  bool afterDue_ = false;   // a rushed frame has made its light, the world has not moved on yet
+  bool afterAlive_ = false, afterBusy_ = false;
+  int eyeBand_ = 0;         // the band of the image for the eye that is due next
+  double faceClock_ = -1;   // the time an image for the eye made in bands applies to; negative: none in progress
+  bool glareDue_ = false;   // a piece of the world has moved the sky on: the glare follows
+  bool resolveDue_ = false; // a piece of the world has renewed the sums of the haze: the scattered light follows
+  double lightDrawn_ = -1e9;   // when the light was last composed
   bool calm_ = false;     // apart from the water, nothing needs every display refresh right now
   double worldTime_ = -1; // when everything was last recomputed
   double owed_ = 0;       // time elapsed since then that clouds, light and weather still have to catch up on
