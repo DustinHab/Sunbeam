@@ -78,7 +78,7 @@ const Setting SETTINGS[] = {
     {L"Pointer", &Params::pointer},     {L"Stars", &Params::stars},
     {L"Moonlight", &Params::moonlight},   {L"HdrGlow", &Params::glow},
     {L"MoonSize", &Params::moonRadius}, {L"Rays", &Params::rays}, {L"Ground", &Params::ground},
-    {L"Life", &Params::life},
+    {L"Life", &Params::life},           {L"ShootingStars", &Params::meteors},
 };
 
 struct App {
@@ -289,6 +289,7 @@ void loadSettings() {
   p.moonlight = std::clamp(p.moonlight, 0.0f, 3.0f);
   p.glow = std::clamp(p.glow, 1.0f, 6.0f);
   p.life = std::clamp(p.life, 0.0f, 1.0f);
+  p.meteors = std::clamp(p.meteors, 0.0f, 2.0f);
   app->par = p;
   // With live weather, what is in the file counts as set by hand; the sliders stay
   // where the weather has put them.
@@ -464,6 +465,27 @@ bool applyClimate(bool snap) {
   return false;
 }
 
+// The stars turn with the time the image shows: by the clock too slowly to see,
+// a look every two seconds is enough. A sun set by hand brings the stars of the
+// moment at which the real one is as high.
+void updateNight(double t, double clock) {
+  static double seen = -1e9, handAt = -1e9, handWhen = 0, handPlace[2] = {};
+  static float handX = -1, handY = -1;
+  bool moved = app->course == BY_HAND && (app->sunX != handX || app->sunY != handY);
+  if (!moved && app->course != TIME_LAPSE && t >= seen && t - seen < 2.0) return;
+  seen = t;
+  double when = app->course == TIME_LAPSE && app->lapseTime > 0 ? app->lapseTime : clock;
+  if (app->course == BY_HAND) {
+    if (moved || clock - handAt > 600 || handPlace[0] != app->latitude || handPlace[1] != app->longitude) {
+      handX = app->sunX, handY = app->sunY, handAt = clock;
+      handPlace[0] = app->latitude, handPlace[1] = app->longitude;
+      handWhen = timeOfHand(clock, app->sunX * app->render.viewW(), app->sunY * app->render.viewH(), app->latitude, app->longitude, app->render);
+    }
+    when = handWhen;
+  }
+  app->render.setNight(nightOf(starsAt(when, app->latitude, app->longitude), app->latitude, app->render));
+}
+
 // Places sun and moon in the sky: where they were put by hand, where they are by
 // the clock, or in time lapse. Returns whether anything has changed.
 bool updateHeaven(double t) {
@@ -472,6 +494,7 @@ bool updateHeaven(double t) {
   double dt = last > 0 ? std::clamp(t - last, 0.0, 5.0) : 0;
   last = t;
   double clock = clockNow();
+  updateNight(t, clock);
   // The time lapse starts with the current time every time.
   if (course != app->course) app->lapseTime = 0;
   course = app->course;
@@ -1336,6 +1359,7 @@ bool setup() {
   app->hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE, nullptr, onWinEvent, 0, 0,
                               WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
   logf(L"Set up: sky %p, light %p, sun %.0f px", app->sky, app->light, app->render.sunRadius());
+  logf(L"Stars: %d in the catalogue, down to magnitude %.1f", app->render.starCount(), app->render.starsReach());
   return true;
 }
 

@@ -19,11 +19,21 @@ windows.
 | ![Skyline at night with light columns in the water](docs/skyline_night.jpg) | ![Sea in strong wind with whitecaps and cloud shadows](docs/sea_wind.jpg) |
 | ![Thunderstorm over the mountains](docs/thunderstorm.jpg) | ![Settings window](docs/settings.png) |
 
+![Milky Way, stars and a shooting star in a summer night, a detail at full resolution](docs/night_sky.jpg)
+
 ## What it does
 
 - **Sun and moon** follow the clock for a place of your choice, stand where you
-  drag them, or run through the day in time lapse. The moon shows its phase;
-  at night there are stars and the Milky Way.
+  drag them, or run through the day in time lapse. The moon shows its phase.
+- **Night sky**: the stars of the Bright Star Catalogue where they are for the
+  place and the time, with their colors, and the Milky Way from a NASA map.
+  The planets from Mercury to Uranus stand where they are tonight, as bright
+  as they are. How many stars show follows from how dark the sky is: they come
+  out one by one in twilight, a full moon leaves only the brighter ones, over
+  the city few remain. Low stars are dimmed and reddened by the air and
+  twinkle more, in wind more still. Now and then a shooting star, more of them
+  on the nights of the large meteor showers and then from the direction of the
+  shower's radiant.
 - **Clouds** in three layers with volume and their own shadows. One slider
   goes from a clear sky through overcast and rain to a thunderstorm with
   lightning. Lightning lights clouds, rain and the desktop the way the sun does.
@@ -129,6 +139,19 @@ location and the date, warmer in the afternoon than at night.
 Open-Meteo is free for non-commercial use without a key; see their
 [terms](https://open-meteo.com/en/terms).
 
+## More stars
+
+The program carries the Bright Star Catalogue: the 9096 stars the eye can see.
+If a file `stars.bin` lies next to `Sunbeam.exe`, it is used instead.
+`tools\stars\convert.py` writes one from the Hipparcos catalogue: 83 000 stars
+down to magnitude 9. The slider **Stars** above 100 % then shows fainter stars
+instead of only brighter ones. How to get the extract from the ESA archive is
+described at the top of the script.
+
+Hipparcos is not built in because ESA distributes it under
+[CC BY-NC 3.0 IGO](https://www.cosmos.esa.int/web/hipparcos/catalogues): for
+non-commercial use, with the credit "ESA".
+
 ## Checks
 
 The program can render without showing anything, for development and
@@ -136,7 +159,7 @@ measurements:
 
 | Command | Effect |
 |---|---|
-| `Sunbeam.exe --sky <folder>` | Renders the sky of an empty desktop to images. Optional files in the folder: `cases.txt` (times or sun positions), `values.txt` (settings), `windows.txt`, `near.txt`, `run.txt`, `flash.txt`, `sequence.txt`, `glide.txt`, `place.txt`, `props.txt` (ships, aircraft and birds to place in the image). |
+| `Sunbeam.exe --sky <folder>` | Renders the sky of an empty desktop to images. Optional files in the folder: `cases.txt` (times or sun positions), `values.txt` (settings), `windows.txt`, `near.txt`, `run.txt`, `flash.txt`, `sequence.txt`, `glide.txt`, `place.txt`, `props.txt` (ships, aircraft and birds to place in the image), `stars.txt` (the time whose stars a sun set by hand shows), `meteors.txt` (shooting stars to place in the image). The report lists the planets and the active meteor showers. |
 | `Sunbeam.exe --check <folder>` | Renders a test scene and measures frame times. |
 | `Sunbeam.exe --real <folder> [x y]` | Renders the image for the windows and icons currently on the desktop. Icons are drawn as blocks. |
 | `Sunbeam.exe --drift <folder>` | Compares drifting clouds with a reference rendering. |
@@ -164,14 +187,16 @@ card.
 | `src\scene.cpp` | Reads windows, taskbar and icons |
 | `src\motion.cpp` | Follows the pointer and a dragged window and computes ahead where they will be; pace of the display |
 | `src\panel.cpp` | Settings window (Direct2D) |
-| `src\astro.cpp`, `src\daycycle.cpp` | Positions of sun and moon and their place in the image |
+| `src\astro.cpp`, `src\daycycle.cpp` | Positions of sun, moon, stars and planets, meteor showers, and their place in the image |
 | `src\weather.cpp`, `src\place.cpp`, `src\net.cpp` | Live weather, place search, HTTPS |
 | `src\life.cpp` | When a ship, an aircraft or birds appear, and how they move |
 | `src\check.cpp` | Check modes |
 | `shader\sky.hlsl`, `shader\clouds.hlsli`, `shader\ground.hlsli` | Sky, clouds, rain, lightning, land and water |
+| `shader\night.hlsl` | Milky Way, stars, planets, shooting stars |
 | `shader\light.hlsl` | Scattered light, shadows, glare, dust |
-| `ground\`, `clouds\`, `images\`, `models\` | Data built into the program |
+| `ground\`, `clouds\`, `images\`, `models\`, `stars\` | Data built into the program |
 | `tools\ground\` | Scripts that produced the ground strips |
+| `tools\stars\` | Script that converted the star catalogue and the map of the Milky Way |
 | `tools\models\` | Script that converted the models |
 
 ## Limits
@@ -181,6 +206,16 @@ card.
   A window that does not follow the pointer in a steady way, or that moves
   without the mouse, is taken as last read: the light is then up to one
   refresh behind it.
+- The image shows the sky compressed, and not everything in it by the same
+  rule: sun, moon and planets each run their own arc from the left edge to the
+  right, the stars turn behind them as a panorama of most of the sky. Moon
+  and planets are at their true altitude at the true time, but not exactly at
+  their place among the stars. With the sun set by hand the moon is opposite
+  it, wherever it really is.
+- Shooting stars that belong to no shower come six times as often as in
+  reality; the showers keep their true rates. The built-in catalogue ends near
+  magnitude 7: without a larger one (see "More stars") the slider Stars above
+  100 % makes the sky brighter, not deeper.
 - Wind direction is fixed; live weather sets only its strength.
 - No sound.
 - Snow lies on the land but does not pile up on ships or freeze the water; the
@@ -197,6 +232,7 @@ card.
 Sunbeam is released under the [MIT licence](LICENSE). It uses methods, code and
 data from others, among them three-geospatial (clouds), the ocean lighting
 method of Bruneton, Neyret and Holzschuch, swisstopo, the U.S. Geological
-Survey, OpenStreetMap, NASA and Open-Meteo, and models by RM02, hungry_drifter,
+Survey, OpenStreetMap, NASA, the Bright Star Catalogue and Open-Meteo, and
+models by RM02, hungry_drifter,
 MesXwi, Julian Johnson-Mortimer and mgg8, which keep their own licences (CC BY
 4.0 and CC0). The full list with licences is in [CREDITS.md](CREDITS.md).

@@ -36,7 +36,7 @@ cbuffer SkyC : register(b0) {
   float uEvolve;     // time by which the shapes of the clouds change
   float uSkyGain;    // strength of the light source for the scattered light of the air: sun 1, moon a fraction
   float uTime;
-  float uStars;
+  float uTown;       // how brightly the lights of a city below shine into the night sky, 0 to 1
   float3 uSunAtm;    // direction to the light source that the air computes with: its true elevation
   float uSrcMoon;    // 1: the light source is the moon
   float3 uCloudCol;  // light of the light source at the height of the cumulus clouds
@@ -94,6 +94,7 @@ Texture2D tBolt : register(t21);    // lightning channel, filament and narrow gl
 Texture2D tBoltFar : register(t22); // its wide glow, at a quarter of the edge length
 Texture2D tShade : register(t23);   // shadow of the clouds on the water: what they transmit there of the light source's light
 Texture2D tColumn : register(t24);  // the strip above the horizon, summed from top to bottom (see Column)
+Texture2D tNight : register(t27);   // the night sky: Milky Way, stars, planets, shooting stars; their light as it enters the image
 
 static float cloudShift;   // shift of the clouds by the wind, in tiles
 static float cloudAge;     // time by which their shapes change
@@ -238,6 +239,9 @@ float3 skyColor(float3 d) {
   float side = 0.3 + 0.7 * exp(-az * az / 0.10);
   float up = max(d.y, 0.0);
   col += uAfter * side * (exp(-up / 0.05) + float3(0.45, 0.2, 0.3) * exp(-up / 0.17));
+  // Over a city the night sky is never dark: its lights brighten the air above
+  // it, warm and brightest over the roofs, paler higher up.
+  col += uTown * (float3(0.15, 0.10, 0.055) * exp(-up / 0.07) + float3(0.024, 0.021, 0.02));
   return col + uNight * NIGHT;
 }
 
@@ -531,45 +535,6 @@ float4 Haze(float4 pos : SV_Position) : SV_Target {
   return float4(haze * uExposure, 1.0);
 }
 
-// Stars: two layers, a few bright ones and many faint ones. Each has its own
-// color and twinkles slightly. band raises the number of faint ones in the band
-// of the Milky Way.
-float3 starField(float3 d, float band) {
-  float3 sum = 0.0;
-  for (int layer = 0; layer < 2; layer++) {
-    float cells = layer == 0 ? 80.0 : 250.0;   // cells per focal length
-    float2 g = d.xy / d.z * cells + float(layer) * 37.0;
-    float2 id = floor(g);
-    float h = hash12(id);
-    float keep = layer == 0 ? 0.90 : 0.84 - 0.22 * band;
-    if (h < keep) continue;
-    float2 off = (float2(hash12(id + 7.1), hash12(id + 3.3)) - 0.5) * 0.7;
-    float2 dl = (frac(g) - 0.5 - off) / cells * uFocal;   // distance in logical pixels
-    float mag = hash12(id + 1.7);
-    float bright = layer == 0 ? 0.25 + 2.6 * mag * mag * mag : 0.05 + 0.3 * mag * mag;
-    float r = layer == 0 ? 0.75 + 0.45 * mag : 0.62;
-    float core = exp(-dot(dl, dl) / (r * r));
-    float twinkle = 1.0 + (layer == 0 ? 0.28 : 0.15) * sin(uTime * (1.5 + 4.0 * hash12(id + 5.5)) + 40.0 * h);
-    float3 tint = lerp(float3(1.0, 0.80, 0.60), float3(0.70, 0.83, 1.0), saturate(hash12(id + 9.9) * 1.3));
-    sum += tint * (bright * core * twinkle);
-  }
-  return sum;
-}
-
-// The band of the Milky Way: a great circle slanted across the sky, in it bright
-// clouds of distant stars and dark dust lanes.
-float milkyBand(float3 d, out float3 glow) {
-  static const float3 AXIS = float3(0.52, 0.79, -0.33);   // pole of the great circle
-  float off = dot(d, AXIS);
-  float band = exp(-off * off / 0.010);
-  float3 q = d * 2.1 + 0.37;
-  float clump = tNoise.SampleLevel(sWrap, q, 1.0).a;
-  float lanes = tNoise.SampleLevel(sWrap, q * 2.3 + 0.2, 0.0).g;
-  float body = band * saturate(0.35 + 1.5 * (clump - 0.42)) * saturate(1.5 - 1.7 * lanes * exp(-off * off / 0.002));
-  glow = float3(0.62, 0.70, 1.0) * (0.045 * body);
-  return body;
-}
-
 #include "ground.hlsli"
 
 // The lightning channel, drawn once per lightning strike: a glaring filament a
@@ -782,16 +747,9 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
   float3 sky = tBase.SampleLevel(sClamp, uv, 0.0).rgb + aureole(p);
   float alpha = cloud.a;
 
-  // Behind the clouds: stars, moon and sun disc.
+  // Behind the clouds: the night sky (see night.hlsl), moon and sun disc.
   float3 back = 0.0;
-  if (uNight * uStars > 0.01) {
-    float3 d = dirOf(p);
-    float3 glow;
-    float band = milkyBand(d, glow);
-    // Close above the horizon the air absorbs the starlight.
-    float clear = smoothstep(0.0, 0.16, d.y);
-    back += (starField(d, band) + glow) * (uNight * uStars * clear);
-  }
+  float3 night = tNight.SampleLevel(sClamp, uv, 0.0).rgb;
   if (uSrcMoon < 0.5) {
     float cover;
     back += uDiscCol * sunFace(p - uSun, uSunR, uShape.x, cover) * uShow;
@@ -802,9 +760,10 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
     float cover;
     float3 face = moonFace(p - uMoon, uMoonR, uMoonLit, uMoonLimb, uMoonSpin, uShape.y, cover);
     back *= 1.0 - cover;
+    night *= 1.0 - cover;
     if (uShow > 0.5 || uSrcMoon < 0.5) back += uMoonCol * face;
   }
-  sky += back * uExposure;
+  sky += back * uExposure + night;
   // Above a thunderstorm the high sky is overcast too: in the gaps there is pale
   // gray, no blue.
   sky = lerp(sky, luma(sky) * float3(0.92, 0.95, 1.0) * 0.8, 0.9 * uStorm.x);

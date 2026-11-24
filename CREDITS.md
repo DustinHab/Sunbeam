@@ -18,13 +18,24 @@ Further methods, implemented from the publications: multiple scattering in
 clouds after Wrenninge and Kulla; slope statistics of the sea after Cox and Munk;
 wave spectrum after Pierson and Moskowitz; whitecap coverage after Callaghan et
 al. (2008); interleaved gradient noise after Jimenez; positions of sun and moon
-from the low-precision series of the Astronomical Almanac.
+from the low-precision series of the Astronomical Almanac; positions of the
+planets from E. M. Standish, "Keplerian Elements for Approximate Positions of
+the Major Planets" (JPL Solar System Dynamics); their brightness after Mallama
+and Hilton (2018); precession with the angles of the IAU 1976; meteor showers
+(dates, radiants, speeds, rates) after the working list of the International
+Meteor Organization, their rise and fall as exponentials around the maximum as
+in Jenniskens (1994), with slopes chosen to match the usual course of each
+shower; air mass after Kasten and Young (1989);
+temperature of a star from its color index after Ballesteros (2012), and the
+color of that temperature by the fit of Tanner Helland.
 
 ## Data
 
 | Data | Source | Terms |
 |---|---|---|
 | Moon map and relief (`images/`) | CGI Moon Kit, <https://svs.gsfc.nasa.gov/4720>. Credit: NASA's Scientific Visualization Studio | Public domain |
+| Stars (`stars/stars.bin`) | Bright Star Catalogue, 5th Revised Edition: D. Hoffleit, W. H. Warren Jr. (1991), Yale University Observatory | No terms stated at the source; distributed freely by the astronomical data centers |
+| Milky Way (`stars/milkyway.jpg`) | Deep Star Maps 2020, <https://svs.gsfc.nasa.gov/4851>. Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio. Gaia DR2: ESA/Gaia/DPAC | Public domain |
 | Mountain panorama (`ground/mountains_*.png`): swissALTI3D, swissSURFACE3D Raster, SWISSIMAGE | Source: Federal Office of Topography swisstopo | Free use with reference to the source |
 | Chicago skyline (`ground/city_*.png`): lidar, 3D Elevation Program, Cook County 2017 | Credit: U.S. Geological Survey | Public domain |
 | Building outlines, names and heights for the skyline | © OpenStreetMap contributors, <https://www.openstreetmap.org/copyright> | Open Database License |
@@ -32,7 +43,13 @@ from the low-precision series of the Astronomical Almanac.
 | Place search (at run time, when a name is entered) | Open-Meteo geocoding; location data based on [GeoNames](https://www.geonames.org) | CC BY 4.0 |
 
 Details on the ground strips are in [ground/SOURCES.txt](ground/SOURCES.txt), on
-the moon in [images/SOURCES.txt](images/SOURCES.txt).
+the moon in [images/SOURCES.txt](images/SOURCES.txt), on the stars in
+[stars/SOURCES.txt](stars/SOURCES.txt).
+
+Not included, but usable as a larger star catalogue (README, "More stars"):
+the Hipparcos catalogue, ESA, 1997, The Hipparcos and Tycho Catalogues, ESA
+SP-1200. ESA distributes it under CC BY-NC 3.0 IGO and asks for the credit
+"ESA".
 
 ## Models
 

@@ -38,6 +38,13 @@ set FXC=fxc /nologo /O2
 %FXC% /T ps_5_0 /E PropIn      /Vn sh_propin      /Fh out\sh\propin.h      shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Prop        /Vn sh_prop        /Fh out\sh\prop.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Lamp        /Vn sh_lamp        /Fh out\sh\lamp.h        shader\sky.hlsl >nul || goto failed
+%FXC% /T vs_5_0 /E WholeVS     /Vn sh_wholevs     /Fh out\sh\wholevs.h     shader\night.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Milky       /Vn sh_milky       /Fh out\sh\milky.h       shader\night.hlsl >nul || goto failed
+%FXC% /T vs_5_0 /E StarVS      /Vn sh_starvs      /Fh out\sh\starvs.h      shader\night.hlsl >nul || goto failed
+%FXC% /T vs_5_0 /E BodyVS      /Vn sh_bodyvs      /Fh out\sh\bodyvs.h      shader\night.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Star        /Vn sh_star        /Fh out\sh\star.h        shader\night.hlsl >nul || goto failed
+%FXC% /T vs_5_0 /E TrailVS     /Vn sh_trailvs     /Fh out\sh\trailvs.h     shader\night.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Trail       /Vn sh_trail       /Fh out\sh\trail.h       shader\night.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Scatter     /Vn sh_scatter     /Fh out\sh\scatter.h     shader\light.hlsl >nul || goto failed
 %FXC% /T cs_5_0 /E Volume      /Vn sh_volume      /Fh out\sh\volume.h      shader\light.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Far         /Vn sh_far         /Fh out\sh\far.h         shader\light.hlsl >nul || goto failed

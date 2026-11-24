@@ -16,6 +16,7 @@
 #include <d3dkmthk.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -258,6 +259,7 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
               {"Stars", &Params::stars},        {"Moonlight", &Params::moonlight},   {"HdrGlow", &Params::glow},
               {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground},
               {"Life", &Params::life},         {"Fog", &Params::fog},          {"Temperature", &Params::temperature},
+              {"ShootingStars", &Params::meteors},
               {"DayTemperature", &Params::dayTemperature}, {"SnowDepth", &Params::snowDepth}, {"Pointer", &Params::pointer},
               {"Resolution", &Params::resolution}};
   char key[64];
@@ -1324,6 +1326,29 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
   // flash.txt: every image contains a lightning flash at full brightness.
   bool lightning = GetFileAttributesW((dir + L"\\flash.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
 
+  // stars.txt: the time whose stars the cases with a sun or moon set by hand
+  // show, as year, month, day, hour, minute in the local time of the computer.
+  double starsWhen = 0;
+  if (!_wfopen_s(&in, (dir + L"\\stars.txt").c_str(), L"r") && in) {
+    int y, mo, d, h, mi;
+    if (fscanf_s(in, "%d %d %d %d %d", &y, &mo, &d, &h, &mi) == 5) {
+      std::tm t = {};
+      t.tm_year = y - 1900, t.tm_mon = mo - 1, t.tm_mday = d, t.tm_hour = h, t.tm_min = mi, t.tm_isdst = -1;
+      starsWhen = double(std::mktime(&t));
+    }
+    fclose(in);
+  }
+  // meteors.txt: shooting stars set into the image. Per line where it starts and
+  // where it ends (fractions of the image), its magnitude and how much of its
+  // flight is over (0 to 1): there it stays. With a negative number it flies, from
+  // the first image of run.txt on.
+  std::vector<std::array<float, 6>> meteors;
+  if (!_wfopen_s(&in, (dir + L"\\meteors.txt").c_str(), L"r") && in) {
+    std::array<float, 6> m;
+    while (fscanf_s(in, "%f %f %f %f %f %f", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) meteors.push_back(m);
+    fclose(in);
+  }
+
   // props.txt: what is in the image instead of what would appear by chance. Per
   // line a model (container, freighter, dinghy, airliner, gull), its position in
   // meters (right, above the water, ahead) and its heading in degrees (0 away
@@ -1458,6 +1483,17 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
       h.moonSpin = 0.3f;
     }
     r.setHeaven(h);
+    // The stars of that time; for a sun set by hand those of the moment at which
+    // the real sun is as high, or of the time in stars.txt.
+    double starTime = c.hand ? (starsWhen > 0 ? starsWhen : timeOfHand(now, h.sunX, h.sunY, latitude, longitude, r)) : c.time;
+    Stars stars = starsAt(starTime, latitude, longitude);
+    Night night = nightOf(stars, latitude, r);
+    r.setNight(night);
+    if (n == 0) {
+      for (const auto& m : meteors) {
+        if (m[5] >= 0) r.meteorNow(m[0], m[1], m[2], m[3], m[4], m[5]);
+      }
+    }
     // The same cloud state in every image so that they can be compared.
     if (shift >= 0) r.seek(shift);
     for (int i = 0; i < 300; i++) {
@@ -1557,6 +1593,10 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
         fclose(run);
       }
       if (count > 0 && tall > 0) {
+        // Shooting stars with a negative part of their flight start now and fly.
+        for (const auto& m : meteors) {
+          if (m[5] < 0) r.meteorNow(m[0], m[1], m[2], m[3], m[4], m[5]);
+        }
         Image strip;
         strip.w = 1280, strip.h = tall * count;
         strip.px.assign(size_t(strip.w) * strip.h * 4, 255);
@@ -1625,6 +1665,25 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
             c.name.c_str(), h.sunX, h.sunY, r.altitudeOfRow(h.sunY), h.moonX, h.moonY, h.moonLit, r.altitudeOfRow(h.moonY),
             r.moonShines() ? "moon" : "sun", top[0], top[1], top[2], low[0], low[1], low[2]);
     if (!c.hand) fprintf(log, "             Sun az %.1f alt %.1f, moon az %.1f alt %.1f\n", b.sunAz, b.sunAlt, b.moonAz, b.moonAlt);
+    // The night sky: how deep the eye sees, what is up.
+    {
+      static const char* names[PLANETS] = {"Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus"};
+      std::time_t whole = std::time_t(starTime);
+      std::tm utc = {};
+      gmtime_s(&utc, &whole);
+      fprintf(log, "             Stars of %04d-%02d-%02d %02d:%02d UTC: faintest magnitude %.1f, %d of %d stars drawn, %.0f shooting stars an hour\n",
+              utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, r.starLimit(), r.starsDrawn(), r.starCount(), r.meteorRate());
+      for (int i = 0; i < PLANETS; i++) {
+        const Planet& p = stars.planet[i];
+        fprintf(log, "               %-8s az %6.1f alt %6.1f magnitude %5.1f", names[i], p.az, p.alt, p.magnitude);
+        if (p.alt >= -1) fprintf(log, "  in the image at %5.0f %5.0f", night.planet[i].x, night.planet[i].y);
+        fprintf(log, "\n");
+      }
+      for (int i = 0; i < SHOWERS; i++) {
+        if (stars.showerRate[i] < 0.2) continue;
+        fprintf(log, "               %s: %.1f an hour at the zenith, radiant az %.0f alt %.0f\n", shower(i).name, stars.showerRate[i], stars.showerAz[i], stars.showerAlt[i]);
+      }
+    }
     if (r.rainHere() > 0) fprintf(log, "             Rain at the viewer %.2f\n", r.rainHere());
     fflush(log);
   }
@@ -1689,6 +1748,7 @@ int runDrift(const std::wstring& dir, int viewW, int viewH, float scale) {
     r->setScene(scene);
     r->setIconMask(mask.data(), pw, ph);
     r->setHeaven(heavenOfHand(sunX * viewW, sunY * viewH, bodiesAt(1795478400.0, 52.5, 13.4), *r));
+    r->setNight(nightOf(starsAt(timeOfHand(1795478400.0, sunX * viewW, sunY * viewH, 52.5, 13.4, *r), 52.5, 13.4), 52.5, *r));
   }
   if (shift >= 0) moving.seek(shift);
   Offscreen skyOut = makeOffscreen(dev.Get(), pw, ph), lightOut = makeOffscreen(dev.Get(), pw, ph);

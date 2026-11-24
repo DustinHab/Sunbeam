@@ -1,0 +1,24 @@
+stars.bin
+  The 9096 stars of the Bright Star Catalogue, 5th Revised Edition (D. Hoffleit,
+  W. H. Warren Jr., 1991, Yale University Observatory; catalogue V/50 of the
+  astronomical data centers): place for the equator and equinox of J2000,
+  visual magnitude and color index B-V. File bsc5.dat from
+  http://tdc-www.harvard.edu/catalogs/bsc5.html, converted with
+  tools\stars\convert.py. The 14 entries without a place (novae and objects
+  that are no stars) are left out. The source states no terms of use; the
+  catalogue is distributed freely by the astronomical data centers.
+
+  A larger catalogue is not included: a file stars.bin next to Sunbeam.exe
+  takes the place of this one. convert.py writes it from an extract of the
+  Hipparcos catalogue (ESA, 1997, The Hipparcos and Tycho Catalogues, ESA
+  SP-1200), which ESA distributes under CC BY-NC 3.0 IGO with the credit
+  "ESA": https://www.cosmos.esa.int/web/hipparcos/catalogues
+
+milkyway.jpg
+  The glow of the Milky Way: milkyway_2020_4k.exr from "Deep Star Maps 2020",
+  https://svs.gsfc.nasa.gov/4851, made from the star catalogues Hipparcos-2,
+  Tycho-2 and Gaia DR2. Converted with tools\stars\convert.py: right ascension
+  to the right from 0 h, brightest region at 1, stored as the square root of
+  the brightness.
+  Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio.
+  Gaia DR2: ESA/Gaia/DPAC. Public domain (work of NASA).

@@ -6,6 +6,9 @@ TURBULENCE RCDATA "clouds\\turbulence.png"
 // NASA moon map, see images\SOURCES.txt
 MOON_MAP RCDATA "images\\moon.jpg"
 MOON_RELIEF RCDATA "images\\moon_relief.bin"
+// The stars, see stars\SOURCES.txt
+STARS RCDATA "stars\\stars.bin"
+MILKY_WAY RCDATA "stars\\milkyway.jpg"
 // Ground: mountain panorama from swisstopo data, see ground\SOURCES.txt
 MOUNTAINS_A RCDATA "ground\\mountains_a.png"
 MOUNTAINS_B RCDATA "ground\\mountains_b.png"

@@ -227,8 +227,10 @@ float3 cloudLight(float od, float ph[8], float grad) {
   // below the closed cloud deck the light of the sky is missing. Only thin edges
   // stay bright.
   float heavy = uStorm.x * (1.0 - exp(-od / 30.0));
+  // Over a city the lamps light the undersides at night.
   return uCloudCol * (SUN_E * CL_GAIN * e * (1.0 - 0.72 * heavy)) + uAmb * (CL_SKY * grad * (1.0 - 0.55 * uStorm.x))
-       + uSunCol * (SUN_E * 0.006 * (2.0 - 2.0 * grad) * (1.0 - 0.8 * uStorm.x));
+       + uSunCol * (SUN_E * 0.006 * (2.0 - 2.0 * grad) * (1.0 - 0.8 * uStorm.x))
+       + float3(1.0, 0.76, 0.48) * (uTown * 0.035 * (1.5 - grad));
 }
 
 static float cloudSquare;   // sum for the spread of the distance, see cloudLayer

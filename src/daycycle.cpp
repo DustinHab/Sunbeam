@@ -58,6 +58,41 @@ Heaven heavenOfHand(float sunX, float sunY, const Bodies& b, const Renderer& r) 
   return h;
 }
 
+double timeOfHand(double now, float sunX, float sunY, double latitude, double longitude, const Renderer& r) {
+  // Looking south the sun sets on the right, looking north on the left.
+  bool south = latitude >= bodiesAt(now, latitude, longitude).sunDec;
+  bool setting = (sunX > 0.5f * r.viewW()) == south;
+  return timeOfSunAltitude(now, r.altitudeOfRow(sunY), setting, latitude, longitude);
+}
+
+Night nightOf(const Stars& s, double latitude, const Renderer& r) {
+  Night n;
+  for (int i = 0; i < 9; i++) n.frame[i] = float(s.frame[i]);
+  n.south = latitude >= 0;
+  for (int i = 0; i < PLANETS; i++) {
+    const Planet& p = s.planet[i];
+    if (p.alt < -1) continue;
+    place(p.az, p.alt, p.dec, latitude, r, n.planet[i].x, n.planet[i].y);
+    n.planet[i].magnitude = float(p.magnitude);
+  }
+  for (int i = 0; i < SHOWERS; i++) {
+    // The lower the radiant, the fewer of its meteors reach the sky above the
+    // place.
+    double rate = s.showerRate[i] * std::sin(s.showerAlt[i] * RAD);
+    if (rate < 0.2) continue;
+    Night::Stream& to = n.stream[n.streams++];
+    to.az = float(s.showerAz[i]), to.alt = float(s.showerAlt[i]);
+    to.rate = float(rate);
+    to.speed = float(shower(i).speed), to.spread = float(shower(i).spread);
+  }
+  // Meteors that belong to no shower: about eight an hour under a dark sky. Most
+  // before dawn, when the place faces the way the Earth moves, fewest in the
+  // evening; and more in autumn than in spring.
+  double hour = std::cos((s.solarHour - 6) * 15 * RAD), season = std::cos((s.sunLongitude - 180) * RAD) * (latitude >= 0 ? 1 : -1);
+  n.sporadic = float(8 * (1 + 0.5 * hour) * (1 + 0.25 * season));
+  return n;
+}
+
 void sunOfMoon(float moonX, float moonY, const Renderer& r, float& sunX, float& sunY) {
   float line = r.horizonRow();
   sunX = r.viewW() - moonX;

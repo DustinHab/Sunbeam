@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <string>
 
 #include "sh/air.h"
 #include "sh/base.h"
@@ -27,6 +29,13 @@
 #include "sh/full.h"
 #include "sh/haze.h"
 #include "sh/lamp.h"
+#include "sh/bodyvs.h"
+#include "sh/milky.h"
+#include "sh/star.h"
+#include "sh/starvs.h"
+#include "sh/trail.h"
+#include "sh/trailvs.h"
+#include "sh/wholevs.h"
 #include "sh/near.h"
 #include "sh/nearblock.h"
 #include "sh/noise.h"
@@ -54,7 +63,7 @@ struct SkyC {
   float amb[3];
   int32_t cloudSteps;
   float span, count, share, back;
-  float evolve, skyGain, time, stars;
+  float evolve, skyGain, time, town;
   float sunAtm[3], srcMoon;
   float cloudCol[3], moonLit;
   float cirrusCol[3], moonLimb;
@@ -95,6 +104,33 @@ struct BoltC {
   float seg[BOLT_MAX][4];
   float par[BOLT_MAX][4];
 };
+
+// The same order as cbuffer NightC in shader\night.hlsl.
+const int BODY_MAX = 8, TRAIL_MAX = 4;
+const int PLANETS_SHOWN = 6;   // as many as Night holds
+struct NightC {
+  float res[2], view[2];
+  float east[4], north[4], up[4];
+  float sheet[4];
+  float lift[4];
+  float depth[4];
+  float milky[4];
+  float body[BODY_MAX][4];
+  float bodyTint[BODY_MAX][4];
+  float trail[TRAIL_MAX][4];
+  float trailPar[TRAIL_MAX][4];
+  float trailLook[TRAIL_MAX][4];
+};
+static_assert(sizeof(NightC) == 576);
+
+// A star in the vertex buffer: its direction in the catalogue (equator and
+// equinox of J2000), its magnitude, its color and a number of its own.
+struct StarV {
+  float dir[3];
+  float mag;
+  uint8_t tint[4];
+};
+static_assert(sizeof(StarV) == 20);
 
 // The same order as cbuffer PropC in shader\sky.hlsl.
 struct PropC {
@@ -361,18 +397,20 @@ struct Ground {
   float shelter;             // fraction of the wind that reaches the water (for the whitecaps)
   float cloudLift;           // the clouds are this much higher above the viewer, meters
   float fogTop[2];           // fog reaches up to this height above the sea: thin fog, dense fog
+  float dark;                // faintest magnitude the eye makes out at the zenith in a clear night without moon
 };
 const Ground GROUNDS[] = {
     // Over the mountains the cloud base is above the highest peaks in the image;
     // otherwise all of them would be in clouds. Fog fills the valleys far below the
     // viewer: a sea of fog.
-    {{L"MOUNTAINS_A", L"MOUNTAINS_B", L"MOUNTAINS_C", nullptr}, false, 0, 2365, {0, 0, 0}, {1, 1, 1}, {1, 1, 1}, 0, 0, 550, {1250, 1950}},
+    {{L"MOUNTAINS_A", L"MOUNTAINS_B", L"MOUNTAINS_C", nullptr}, false, 0, 2365, {0, 0, 0}, {1, 1, 1}, {1, 1, 1}, 0, 0, 550, {1250, 1950}, 7.0f},
     // In front of the city the water is sheltered: almost a mirror at half wind,
     // choppy only in strong wind. Fog lies on the lake; thin fog leaves the towers
-    // standing above it.
+    // standing above it. Its lights brighten the sky: only the brighter stars
+    // remain.
     {{L"CITY_A", L"CITY_B", L"CITY_C", L"CITY_D"}, true, 9, 186, {0.006f, 0.018f, 0.024f}, {0.000003f, 0.001f, 0.006f}, {0.2f, 20, 32}, 0.0006f, 0.4f, 0,
-     {177 + 30, 177 + 420}},
-    {{nullptr, nullptr, nullptr, nullptr}, true, 26, 26, {0.004f, 0.016f, 0.045f}, {0.00005f, 0.014f, 0.07f}, {0.25f, 60, 110}, 0.006f, 1, 0, {40, 420}},
+     {177 + 30, 177 + 420}, 4.6f},
+    {{nullptr, nullptr, nullptr, nullptr}, true, 26, 26, {0.004f, 0.016f, 0.045f}, {0.00005f, 0.014f, 0.07f}, {0.25f, 60, 110}, 0.006f, 1, 0, {40, 420}, 7.0f},
 };
 const int GROUND_COUNT = int(std::size(GROUNDS));
 // The strip: this much tangent is above the horizon, this much it measures in
@@ -548,6 +586,17 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
       {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
   };
   hr |= dev_->CreateInputLayout(vertex, UINT(std::size(vertex)), sh_propvs, sizeof(sh_propvs), &propLayout_);
+  hr |= dev_->CreateVertexShader(sh_wholevs, sizeof(sh_wholevs), nullptr, &vsWhole_);
+  hr |= dev_->CreateVertexShader(sh_starvs, sizeof(sh_starvs), nullptr, &vsStar_);
+  hr |= dev_->CreateVertexShader(sh_bodyvs, sizeof(sh_bodyvs), nullptr, &vsBody_);
+  hr |= dev_->CreateVertexShader(sh_trailvs, sizeof(sh_trailvs), nullptr, &vsTrail_);
+  // One star per instance, six corners each.
+  const D3D11_INPUT_ELEMENT_DESC star[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT, 0, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+      {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+  };
+  hr |= dev_->CreateInputLayout(star, UINT(std::size(star)), sh_starvs, sizeof(sh_starvs), &starLayout_);
   auto pixel = [&](const BYTE* code, size_t size, ComPtr<ID3D11PixelShader>& out) {
     hr |= dev_->CreatePixelShader(code, size, nullptr, &out);
   };
@@ -578,6 +627,9 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   pixel(sh_prop, sizeof(sh_prop), psProp_);
   pixel(sh_propin, sizeof(sh_propin), psPropIn_);
   pixel(sh_lamp, sizeof(sh_lamp), psLamp_);
+  pixel(sh_milky, sizeof(sh_milky), psMilky_);
+  pixel(sh_star, sizeof(sh_star), psStar_);
+  pixel(sh_trail, sizeof(sh_trail), psTrail_);
   if (FAILED(hr)) return false;
 
   D3D11_SAMPLER_DESC sd = {};
@@ -642,6 +694,7 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   buffer(sizeof(WaveC), waveBuf_);
   buffer(sizeof(BoltC), boltBuf_);
   buffer(sizeof(PropC), propBuf_);
+  buffer(sizeof(NightC), nightBuf_);
 
   D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
   dev_->CreateQuery(&qd, &event_);
@@ -652,6 +705,10 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
     if (!loadMesh(i)) mesh_[i] = Mesh();
   }
   if (!loadClouds()) return false;
+  // Without the catalogue the sky has planets only, without the map the Milky
+  // Way is a band from noise.
+  loadStars();
+  pngTexture(dev_.Get(), L"MILKY_WAY", false, false, milky_);
   bindCommon();
   makeNoise();
   haze_ = makeTarget(256, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
@@ -1057,6 +1114,14 @@ void Renderer::resize(int pixelW, int pixelH, float scale) {
   rainCur_ = 0;
   bolt_ = makeTarget(pixW_, pixH_, DXGI_FORMAT_R16G16_FLOAT, false);
   boltFar_ = makeTarget(std::max(1, pixW_ / 4), std::max(1, pixH_ / 4), DXGI_FORMAT_R16G16_FLOAT, false);
+  stars_ = makeTarget(pixW_, pixH_, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
+  {
+    const float black[4] = {0, 0, 0, 1};
+    ctx_->ClearRenderTargetView(stars_.rtv.Get(), black);
+  }
+  nightDirty_ = true;
+  nightShown_ = false;
+  meteors_.clear();
   // The glare should reach equally far on every display. The finest level that
   // enters the image is therefore always about 240 pixels wide.
   bloomBase_ = std::clamp(int(std::lround(std::log2(hw / 240.0))), 1, 4);
@@ -1231,7 +1296,9 @@ void Renderer::updateLight() {
   // the open sky, a little grayer, and in the light of city lamps at night warm.
   // Around the light source it glares, unless clouds hide it.
   const double lamp[3] = {1.0, 0.78, 0.5};
-  const bool city = land_[3] != nullptr;
+  // By the ground that is chosen, not by what is loaded: its strip only arrives
+  // with the first image.
+  const bool city = GROUNDS[groundOf(par_)].strip[3] != nullptr;
   for (int c = 0; c < 3; c++) {
     double lum = 0.2126 * l.skyLand[0] + 0.7152 * l.skyLand[1] + 0.0722 * l.skyLand[2];
     double sun = 0.2126 * l.land[0] + 0.7152 * l.land[1] + 0.0722 * l.land[2];
@@ -1441,7 +1508,9 @@ void Renderer::setOutput(bool linear, float white) {
 void Renderer::setParams(const Params& p) {
   if (p == par_) return;
   bool sky = p.clouds != par_.clouds || p.sunRadius != par_.sunRadius || p.moonRadius != par_.moonRadius || p.rays != par_.rays ||
-             p.stars != par_.stars || p.moonlight != par_.moonlight || p.ground != par_.ground;
+             p.moonlight != par_.moonlight || p.ground != par_.ground;
+  // The stars are an image of their own: only it is made anew.
+  if (p.stars != par_.stars) nightDirty_ = faceDue_ = true;
   bool res = p.resolution != par_.resolution;
   // The haze also lies between eye and ground: the finished image needs it anew,
   // the clouds do not. The same goes for fog and for what the temperature decides.
@@ -1520,7 +1589,7 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   // band.
   double clock = faceClock_ >= 0 ? faceClock_ : time_;
   c.time = float(std::fmod(clock, 3600.0));
-  c.stars = par_.stars;
+  c.town = GROUNDS[groundOf(par_)].strip[3] ? l.lights : 0.0f;
   c.span = float(columnTop_), c.count = float(columnH_);
   Sky wx = skyOf(par_.clouds);
   const Cold cold = coldOf(par_);
@@ -1779,6 +1848,8 @@ void Renderer::bindClouds() {
   ctx_->PSSetShaderResources(0, 5, in);
   ID3D11ShaderResourceView* more[4] = {near_[airNew_].srv.Get(), air_[airOld_].srv.Get(), near_[airOld_].srv.Get(), airZ_[airOld_].srv.Get()};
   ctx_->PSSetShaderResources(9, 4, more);
+  // Behind them the night sky.
+  ctx_->PSSetShaderResources(27, 1, stars_.srv.GetAddressOf());
 }
 
 // Density of the cumulus above a place (meters from the viewer, x to the right,
@@ -2097,6 +2168,370 @@ void Renderer::flashNow(bool hold) {
     flash_.grow = 2;
     flash_.hold = true;
   }
+}
+
+// ---- The night sky ----
+
+namespace {
+
+// In reality a sporadic meteor shows every ten minutes or so; on a desktop that
+// would amount to never. They come this many times as often. The showers keep
+// their true rates.
+const double METEORS_MORE = 6;
+const float MILKY_GAIN = 0.075f;   // brightness of the brightest part of the Milky Way in the image
+const float GLOW_HIDES = 0.8f;     // how much a bright sky around a spot hides what is there (night.hlsl)
+const double NIGHT_EVERY = 1.0 / 20;   // the stars twinkle: their image is made anew this often
+
+// As the sun sinks, the stars come out by brightness: Venus at sunset, the first
+// stars in civil twilight, the faint ones only once it is dark. Altitude of the
+// sun in degrees, and the faintest magnitude visible then.
+const double DUSK[][2] = {{6, -8}, {1, -4.5}, {-1, -3.0}, {-3, -1.0}, {-6, 1.8}, {-9, 3.8}, {-12, 5.3}, {-15, 6.5}, {-18, 9.5}};
+
+// Color of the planets, and how much each twinkles compared to a star: the
+// larger its disc, the less.
+const float PLANET_LOOK[PLANETS_SHOWN][4] = {
+    {0.95f, 0.88f, 0.80f, 0.5f}, {1.0f, 0.97f, 0.88f, 0.2f}, {1.0f, 0.62f, 0.36f, 0.3f},
+    {1.0f, 0.93f, 0.80f, 0.15f}, {1.0f, 0.90f, 0.68f, 0.25f}, {0.70f, 0.95f, 1.0f, 0.6f},
+};
+
+// Color of a star from its color index B-V: its temperature after Ballesteros
+// (2012), then the color of a black body of that temperature (fit by T.
+// Helland). Linear, the brightest channel 255.
+void starTint(double bv, uint8_t* out) {
+  bv = std::clamp(bv, -0.4, 2.0);
+  double t = std::clamp(4600 * (1 / (0.92 * bv + 1.7) + 1 / (0.92 * bv + 0.62)), 1500.0, 40000.0) / 100;
+  double c[3];
+  if (t <= 66) {
+    c[0] = 255;
+    c[1] = 99.4708025861 * std::log(t) - 161.1195681661;
+    c[2] = t <= 19 ? 0 : 138.5177312231 * std::log(t - 10) - 305.0447927307;
+  } else {
+    c[0] = 329.698727446 * std::pow(t - 60, -0.1332047592);
+    c[1] = 288.1221695283 * std::pow(t - 60, -0.0755148492);
+    c[2] = 255;
+  }
+  double peak = 1e-9;
+  for (double& v : c) {
+    v = std::pow(std::clamp(v, 0.0, 255.0) / 255, 2.2);
+    peak = std::max(peak, v);
+  }
+  for (int i = 0; i < 3; i++) out[i] = uint8_t(std::lround(255 * c[i] / peak));
+}
+
+}  // namespace
+
+// The star catalogue (written by tools\stars\convert.py): the mark SBS1, the
+// number of stars, then eight bytes per star: right ascension as a fraction of
+// the circle in 16 bits, declination as a fraction of the right angle in 16 bits
+// with sign, magnitude in thousandths, color index B-V in fiftieths, one byte
+// unused. Brightest first.
+// The program carries the Bright Star Catalogue. A file stars.bin next to it
+// takes its place: a larger catalogue whose licence does not allow building it
+// in.
+bool Renderer::loadStars() {
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+  uint32_t count = 0;
+  auto whole = [&] {
+    if (!data || size < 8 || std::memcmp(data, "SBS1", 4)) return false;
+    std::memcpy(&count, data + 4, 4);
+    return count > 0 && size >= 8 + size_t(count) * 8;
+  };
+  std::vector<uint8_t> file;
+  wchar_t path[MAX_PATH];
+  DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (length > 0 && length < MAX_PATH) {
+    std::wstring beside(path);
+    beside = beside.substr(0, beside.find_last_of(L'\\') + 1) + L"stars.bin";
+    FILE* in = nullptr;
+    if (!_wfopen_s(&in, beside.c_str(), L"rb") && in) {
+      fseek(in, 0, SEEK_END);
+      long bytes = ftell(in);
+      fseek(in, 0, SEEK_SET);
+      // A catalogue of the whole sky down to magnitude 12 would be 30 MB.
+      if (bytes > 8 && bytes < (64 << 20)) {
+        file.resize(size_t(bytes));
+        if (fread(file.data(), 1, file.size(), in) != file.size()) file.clear();
+      }
+      fclose(in);
+    }
+  }
+  data = file.data(), size = file.size();
+  if (!whole() && (!resource(L"STARS", data, size) || !whole())) return false;
+  std::vector<StarV> stars(count);
+  uint32_t dice = 0x9e3779b9u;
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t* p = data + 8 + size_t(i) * 8;
+    uint16_t ra;
+    int16_t dec, mag;
+    std::memcpy(&ra, p, 2);
+    std::memcpy(&dec, p + 2, 2);
+    std::memcpy(&mag, p + 4, 2);
+    double a = ra * (2 * PI / 65536), d = dec * (PI / 2 / 32767);
+    StarV& s = stars[i];
+    s.dir[0] = float(std::cos(d) * std::cos(a));
+    s.dir[1] = float(std::cos(d) * std::sin(a));
+    s.dir[2] = float(std::sin(d));
+    s.mag = mag / 1000.0f;
+    starTint(int8_t(p[6]) / 50.0, s.tint);
+    dice = dice * 1664525u + 1013904223u;
+    s.tint[3] = uint8_t(dice >> 24);
+  }
+  // How many are drawn follows from how deep the eye sees: that needs them in the
+  // order of their brightness.
+  std::stable_sort(stars.begin(), stars.end(), [](const StarV& a, const StarV& b) { return a.mag < b.mag; });
+  starMag_.resize(count);
+  for (uint32_t i = 0; i < count; i++) starMag_[i] = stars[i].mag;
+  D3D11_BUFFER_DESC b = {};
+  b.ByteWidth = UINT(stars.size() * sizeof(StarV));
+  b.Usage = D3D11_USAGE_IMMUTABLE;
+  b.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA init = {stars.data(), 0, 0};
+  if (FAILED(dev_->CreateBuffer(&b, &init, &starBuf_))) {
+    starMag_.clear();
+    return false;
+  }
+  return true;
+}
+
+void Renderer::setNight(const Night& n) {
+  night_ = n;
+  nightSet_ = true;
+}
+
+// The sheet of the stars: fraction of the width per degree of azimuth. Chosen so
+// that at 35 degrees of altitude a degree is as wide as it is high; at most the
+// whole circle fills the width.
+double Renderer::sheetScale() const {
+  double perDegree = double(rowOfAltitude(34.5)) - rowOfAltitude(35.5);
+  return std::max(perDegree * std::cos(35 * PI / 180) / viewW_, 1.0 / 360);
+}
+
+void Renderer::skyPoint(double az, double alt, float& x, float& y) const {
+  double a = std::fmod(az - (night_.south ? 180.0 : 0.0) + 900.0, 360.0) - 180.0;
+  x = float(viewW_ * (0.5 + sheetScale() * a));
+  y = rowOfAltitude(alt);
+}
+
+// How deep the eye sees into the sky right now. On a clear night without moon,
+// far from any town, that is about magnitude 7. Twilight, moonlight and the
+// lights of a city each take their share; the slider Stars adds or removes two
+// magnitudes.
+Renderer::Depth Renderer::nightDepth() const {
+  Depth d;
+  const Ground& g = GROUNDS[groundOf(par_)];
+  double sunAlt = altitudeOfRow(heaven_.sunY), moonAlt = altitudeOfRow(heaven_.moonY);
+  const int n = int(std::size(DUSK));
+  double cap = DUSK[0][1];
+  if (sunAlt <= DUSK[n - 1][0]) cap = DUSK[n - 1][1];
+  for (int i = 0; i + 1 < n; i++) {
+    if (sunAlt <= DUSK[i][0] && sunAlt > DUSK[i + 1][0]) {
+      cap = DUSK[i][1] + (DUSK[i + 1][1] - DUSK[i][1]) * (DUSK[i][0] - sunAlt) / (DUSK[i][0] - DUSK[i + 1][0]);
+    }
+  }
+  // A full moon high in the sky costs more than two magnitudes, a crescent hardly
+  // anything.
+  double moon = heaven_.moonLit > 0.001f
+                    ? 2.4 * std::pow(double(heaven_.moonLit), 1.4) * smooth(-2, 20, moonAlt) * std::sqrt(std::clamp(double(par_.moonlight), 0.0, 2.0))
+                    : 0.0;
+  double site = g.dark - moon + 2.0 * (par_.stars - 1);
+  // The smaller of the two, with a soft transition.
+  d.limit = float(-std::log(std::exp(-1.5 * site) + std::exp(-1.5 * cap)) / 1.5);
+  // The air: more of it in haze, less of it above 2000 m.
+  d.loss = float((0.14 + 0.22 * par_.density) * (g.eyeSea > 1500 ? 0.7 : 1.0));
+  d.gain = par_.stars <= 1 ? std::max(par_.stars, 0.0f) : 1 + 0.6f * (par_.stars - 1);
+  // Wind aloft churns the air the starlight passes through.
+  d.twinkle = 0.6f + 0.8f * std::clamp(par_.wind, 0.0f, 1.0f);
+  return d;
+}
+
+int Renderer::starsDrawn() const {
+  if (!starBuf_ || !nightSet_ || par_.stars <= 0) return 0;
+  return int(std::upper_bound(starMag_.begin(), starMag_.end(), nightDepth().limit) - starMag_.begin());
+}
+
+bool Renderer::meteorsOn() const { return !meteors_.empty(); }
+
+double Renderer::meteorRate() const {
+  if (!nightSet_ || par_.meteors <= 0 || par_.stars <= 0) return 0;
+  Depth depth = nightDepth();
+  // Before it is dark, none is seen.
+  if (depth.limit < 2.5) return 0;
+  double hourly = night_.sporadic * METEORS_MORE;
+  for (int i = 0; i < night_.streams; i++) hourly += night_.stream[i].rate;
+  // Under a bright sky only the bright ones remain; and the sheet shows a part of
+  // the sky.
+  double seen = std::min(std::pow(2.6, depth.limit - 6.5), 1.3);
+  double often = par_.meteors <= 1 ? par_.meteors : std::pow(8.0, par_.meteors - 1.0);
+  return hourly * seen * often * std::min(1.0, 1.0 / (360 * sheetScale()));
+}
+
+// Shooting stars: when one appears, where it comes from and how it flies.
+// Meteors of a shower all move in parallel; seen from the ground they fly apart
+// from one point of the sky, the radiant. Close to it they are short and slow,
+// at a right angle to it long and fast. A meteor lights up about 110 km above
+// the ground and is gone 25 km lower.
+void Renderer::updateMeteors(double dt) {
+  // Gone once its trail has faded; that of a bright one lingers.
+  std::erase_if(meteors_, [&](const Meteor& m) { return m.held < 0 && time_ - m.born > m.seconds + (m.magnitude < 0.5f ? 22.0 : 7.0) * m.fade; });
+  if (int(meteors_.size()) >= TRAIL_MAX || skyAccum_ == 0) return;
+  double hourly = meteorRate();
+  if (hourly <= 0 || chance() >= std::min(hourly / 3600 * dt, 0.5)) return;
+
+  // From which source: a shower, or none.
+  double total = night_.sporadic * METEORS_MORE;
+  for (int i = 0; i < night_.streams; i++) total += night_.stream[i].rate;
+  double pick = chance() * total - night_.sporadic * METEORS_MORE;
+  double radAz = 360 * chance(), radAlt = std::asin(0.05 + 0.95 * chance()) * 180 / PI, speed = 25 + 45 * chance(), spread = 2.9;
+  for (int i = 0; i < night_.streams && pick >= 0; i++) {
+    const Night::Stream& s = night_.stream[i];
+    if (pick < s.rate) radAz = s.az, radAlt = s.alt, speed = s.speed, spread = s.spread;
+    pick -= s.rate;
+  }
+  auto unit = [](double az, double alt, double* v) {
+    double ca = std::cos(alt * PI / 180);
+    v[0] = std::sin(az * PI / 180) * ca, v[1] = std::cos(az * PI / 180) * ca, v[2] = std::sin(alt * PI / 180);
+  };
+  double from[3], rad[3];
+  unit(radAz, radAlt, rad);
+  double middle = night_.south ? 180.0 : 0.0, scale = sheetScale();
+  for (int attempt = 0; attempt < 8; attempt++) {
+    double az = middle + (chance() - 0.5) * 0.94 / scale, alt = 14 + 62 * chance();
+    unit(az, alt, from);
+    double cosine = std::clamp(dot3(from, rad), -1.0, 1.0), angle = std::acos(cosine);
+    // Straight toward the viewer it would be a point.
+    if (angle < 0.17) continue;
+    double away[3], len = 0;
+    for (int c = 0; c < 3; c++) away[c] = from[c] * cosine - rad[c];
+    len = std::sqrt(dot3(away, away));
+    for (double& c : away) c /= len;
+    double seconds = std::clamp(25 / (std::max(std::sin(radAlt * PI / 180), 0.25) * speed), 0.25, 1.3) * (0.75 + 0.5 * chance());
+    double range = 100 / std::max(std::sin(alt * PI / 180), 0.3);   // kilometers to it
+    double arc = std::clamp(speed / range * std::sin(angle) * seconds, 0.05, 0.7);
+    double to[3];
+    for (int c = 0; c < 3; c++) to[c] = from[c] * std::cos(arc) + away[c] * std::sin(arc);
+    double endAlt = std::asin(std::clamp(to[2], -1.0, 1.0)) * 180 / PI;
+    if (endAlt < 4) continue;
+    Meteor m;
+    skyPoint(az, alt, m.from[0], m.from[1]);
+    skyPoint(std::atan2(to[0], to[1]) * 180 / PI, endAlt, m.to[0], m.to[1]);
+    // Not across the seam of the sheet, and not outside the image.
+    if (std::abs(m.to[0] - m.from[0]) > 0.4f * viewW_) continue;
+    if (std::min(m.from[0], m.to[0]) < 0 || std::max(m.from[0], m.to[0]) > viewW_) continue;
+    m.born = time_;
+    m.seconds = float(seconds);
+    // Most are faint; from one magnitude to the next brighter one their number
+    // falls by the ratio of the shower. Every few hundred there is a fireball.
+    double faintest = std::min(nightDepth().limit - 3.0, 3.5);
+    m.magnitude = float(std::max(faintest + std::log(std::max(double(chance()), 1e-4)) / std::log(spread), -5.0));
+    m.fade = float(std::clamp(0.055 + 0.012 * (faintest - m.magnitude), 0.055, 0.13));
+    m.flare = m.magnitude < 1 && chance() < 0.35f ? 0.5f + chance() : 0.0f;
+    // Fast ones glow greenish, slow ones warm.
+    m.tint = float(std::clamp((speed - 30) / 40, 0.0, 1.0));
+    meteors_.push_back(m);
+    nightDirty_ = true;
+    return;
+  }
+}
+
+void Renderer::meteorNow(float x0, float y0, float x1, float y1, float magnitude, float progress) {
+  Meteor m;
+  m.born = time_;
+  m.from[0] = x0 * viewW_, m.from[1] = y0 * viewH_;
+  m.to[0] = x1 * viewW_, m.to[1] = y1 * viewH_;
+  m.seconds = 0.6f;
+  m.fade = 0.09f;
+  m.magnitude = magnitude;
+  m.flare = magnitude < 0 ? 1.0f : 0.0f;
+  m.tint = 0.5f;
+  m.held = progress;
+  if (int(meteors_.size()) < TRAIL_MAX) meteors_.push_back(m);
+  nightDirty_ = true;
+}
+
+// The night sky into its image: the Milky Way, over it the stars the eye can
+// see right now, the planets, shooting stars. Made anew twenty times a second,
+// because the stars twinkle, and with every frame while a shooting star flies.
+// Returns whether the image has changed.
+bool Renderer::drawNight() {
+  Depth depth = nightDepth();
+  bool show = nightSet_ && depth.gain > 0 && depth.limit > -5;
+  // By day it is empty and stays so.
+  if (!show && !nightShown_ && !nightDirty_) return false;
+  if (!nightDirty_ && show == nightShown_ && meteors_.empty() && time_ - nightDrawn_ < NIGHT_EVERY) return false;
+  nightDirty_ = false;
+  nightShown_ = show;
+  nightDrawn_ = time_;
+  ID3D11ShaderResourceView* none[2] = {};
+  ctx_->PSSetShaderResources(27, 1, none);
+  target(stars_.rtv.Get(), stars_.w, stars_.h);
+  const float black[4] = {0, 0, 0, 1};
+  ctx_->ClearRenderTargetView(stars_.rtv.Get(), black);
+  if (!show) {
+    target(nullptr, 1, 1);
+    return true;
+  }
+
+  NightC c = {};
+  c.res[0] = float(stars_.w), c.res[1] = float(stars_.h);
+  c.view[0] = viewW_, c.view[1] = viewH_;
+  for (int i = 0; i < 3; i++) c.east[i] = night_.frame[i], c.north[i] = night_.frame[3 + i], c.up[i] = night_.frame[6 + i];
+  c.sheet[0] = horizon(), c.sheet[1] = focal(), c.sheet[2] = float(sheetScale()), c.sheet[3] = night_.south ? 180.0f : 0.0f;
+  c.lift[0] = float(std::atan2(double(horizon()), double(focal())) * 180 / PI);
+  c.lift[1] = 0.48f;
+  c.lift[2] = float(std::fmod(time_, 3600.0));
+  c.depth[0] = depth.limit, c.depth[1] = depth.loss, c.depth[2] = depth.gain, c.depth[3] = depth.twinkle;
+  c.milky[0] = MILKY_GAIN * depth.gain, c.milky[1] = milky_ ? 1.0f : 0.0f, c.milky[2] = GLOW_HIDES;
+  for (int i = 0; i < BODY_MAX; i++) {
+    c.body[i][2] = 99;
+    if (i >= PLANETS_SHOWN) continue;
+    const Night::Wanderer& w = night_.planet[i];
+    c.body[i][0] = w.x, c.body[i][1] = w.y, c.body[i][2] = w.magnitude, c.body[i][3] = PLANET_LOOK[i][3];
+    for (int k = 0; k < 3; k++) c.bodyTint[i][k] = PLANET_LOOK[i][k];
+  }
+  int trails = std::min(int(meteors_.size()), TRAIL_MAX);
+  for (int i = 0; i < trails; i++) {
+    const Meteor& m = meteors_[i];
+    c.trail[i][0] = m.from[0], c.trail[i][1] = m.from[1], c.trail[i][2] = m.to[0], c.trail[i][3] = m.to[1];
+    c.trailPar[i][0] = m.held >= 0 ? m.held * m.seconds : float(time_ - m.born);
+    c.trailPar[i][1] = m.seconds, c.trailPar[i][2] = m.fade, c.trailPar[i][3] = m.magnitude;
+    c.trailLook[i][0] = m.tint, c.trailLook[i][1] = m.flare;
+  }
+  ctx_->UpdateSubresource(nightBuf_.Get(), 0, nullptr, &c, 0, 0);
+  ctx_->VSSetConstantBuffers(0, 1, nightBuf_.GetAddressOf());
+  ctx_->PSSetConstantBuffers(0, 1, nightBuf_.GetAddressOf());
+  ctx_->VSSetShaderResources(4, 1, base_.srv.GetAddressOf());
+  ctx_->PSSetShaderResources(4, 1, base_.srv.GetAddressOf());
+  ctx_->PSSetShaderResources(0, 1, noise_.GetAddressOf());
+  ctx_->PSSetShaderResources(28, 1, milky_.GetAddressOf());
+
+  ctx_->VSSetShader(vsWhole_.Get(), nullptr, 0);
+  ctx_->PSSetShader(psMilky_.Get(), nullptr, 0);
+  ctx_->Draw(3, 0);
+
+  // Light adds up.
+  ctx_->OMSetBlendState(blendAdd_.Get(), nullptr, 0xffffffff);
+  ctx_->PSSetShader(psStar_.Get(), nullptr, 0);
+  if (int count = starsDrawn(); count > 0) {
+    UINT stride = sizeof(StarV), offset = 0;
+    ctx_->IASetInputLayout(starLayout_.Get());
+    ctx_->IASetVertexBuffers(0, 1, starBuf_.GetAddressOf(), &stride, &offset);
+    ctx_->VSSetShader(vsStar_.Get(), nullptr, 0);
+    ctx_->DrawInstanced(6, count, 0, 0);
+    ID3D11Buffer* nothing = nullptr;
+    ctx_->IASetVertexBuffers(0, 1, &nothing, &stride, &offset);
+    ctx_->IASetInputLayout(nullptr);
+  }
+  ctx_->VSSetShader(vsBody_.Get(), nullptr, 0);
+  ctx_->Draw(6 * PLANETS_SHOWN, 0);
+  if (trails > 0) {
+    ctx_->VSSetShader(vsTrail_.Get(), nullptr, 0);
+    ctx_->PSSetShader(psTrail_.Get(), nullptr, 0);
+    ctx_->Draw(6 * trails, 0);
+  }
+  ctx_->PSSetShaderResources(28, 1, none);
+  target(nullptr, 1, 1);
+  return true;
 }
 
 // Loads the selected ground: the strip with the land, if it has one, and the
@@ -3083,6 +3518,7 @@ Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, 
   updateWeather(dt, urgent);
   updateFlash();
   if (boltDue_) drawBolt();
+  updateMeteors(dt);
   // While there is lightning, every frame needs the new state, and one frame after
   // it the darkness.
   bool flick = flash_.level > 0.001f || flashDrawn_ > 0.001f;
@@ -3122,10 +3558,18 @@ Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, 
   bool tick = moving && ++faceTick_ % 2 == 0;
   bool due = faceDue_ && skyAccum_ > 0;
   if (due) faceDue_ = false;
+  // The night sky behind the clouds. Not while an image for the eye is being made
+  // in bands: all of them show the same moment.
+  if (urgent) nightDirty_ = true;
+  bool starry = faceClock_ < 0 && drawNight();
+  bool streaking = meteorsOn();
+  mark("night sky");
   // What moves through the image is also in the image for the light and in the
   // one the water mirrors: both follow once it has moved visibly, at most thirty
   // times per second.
   bool shifted = alive && GROUNDS[groundOf(par_)].water && skyAccum_ > 0 && time_ - lightTime_ >= 1.0 / 31 && propsShifted();
+  // A shooting star is mirrored in the water while it flies.
+  shifted = shifted || (streaking && GROUNDS[groundOf(par_)].water && skyAccum_ > 0);
   if (passDone || drifted || tick || due || flick || shifted) {
     bool glare = !urgent && (passDone || drifted || flick || faceTick_ % 4 == 0);
     if (defer) {
@@ -3139,8 +3583,9 @@ Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, 
     }
   }
   mark("sky for light");
-  // At night the stars twinkle: even without drifting clouds a frame at intervals.
-  bool twinkling = light_.night > 0.3f && par_.stars > 0 && skyAccum_ > 0 && time_ - faceTime_ > 1.0 / 20;
+  // At night the stars twinkle: even without drifting clouds a frame whenever
+  // their image has been made anew.
+  bool twinkling = starry && skyAccum_ > 0;
   // Water is always in motion.
   bool rippling = GROUNDS[groundOf(par_)].water && skyAccum_ > 0 && time_ - faceTime_ > 1.0 / 62;
   // Rain keeps falling in every frame.
@@ -3164,7 +3609,7 @@ Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, 
   }
   // The image is calm when nothing except the water and what moves through the
   // image needs every refresh.
-  calm_ = (GROUNDS[groundOf(par_)].water || !props_.empty()) && skyAccum_ >= SKY_ACC && !urgent && !busy && !flick && rainHere_ <= 0.003f;
+  calm_ = (GROUNDS[groundOf(par_)].water || !props_.empty()) && skyAccum_ >= SKY_ACC && !urgent && !busy && !flick && rainHere_ <= 0.003f && !streaking;
   mark("sky for eye");
   // What moves by itself flows in gradually; after a user change the averaging
   // starts anew so that the light follows at once.
@@ -3334,7 +3779,8 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   glareDue_ = resolveDue_ = false;
   // While the light is still averaging in, every full frame counts.
   calm_ = calm_ && accum_ >= ACC_FRAMES;
-  out.lively = calm_;
+  // A shooting star is over in less than a second: every refresh shows it.
+  out.lively = calm_ || meteorsOn();
   target(nullptr, 1, 1);
   return out;
 }

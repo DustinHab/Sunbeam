@@ -59,6 +59,30 @@ struct Heaven {
   bool operator==(const Heaven&) const = default;
 };
 
+// The night sky: how the stars stand, where the planets are in the image and
+// where shooting stars come from.
+struct Night {
+  // Turns a direction of the star catalogue into east, north and up at the place:
+  // three rows.
+  float frame[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  bool south = true;   // the image looks south, east is on the left; otherwise north
+  struct Wanderer {
+    float x = 0, y = 0;      // logical pixels
+    float magnitude = 99;    // 99: not in the sky
+  } planet[6];
+  // A meteor shower that is active: its radiant in degrees, its meteors per hour
+  // for someone under a dark sky, their speed in kilometers per second and the
+  // ratio of their numbers from one magnitude to the next.
+  struct Stream {
+    float az = 0, alt = 0;
+    float rate = 0;
+    float speed = 40;
+    float spread = 2.5f;
+  } stream[9];
+  int streams = 0;
+  float sporadic = 0;    // meteors per hour that belong to no shower
+};
+
 struct Params {
   float density = 0.55f;      // Haze
   float mist = 0.5f;          // Mist
@@ -82,7 +106,8 @@ struct Params {
   float overSky = 0.4f;       // Over sky: fraction of the scattered light in front of open sky
   float pointer = 1.0f;       // Pointer: strength of its shadow and of its fringe
   float shade = 0.6f;         // Shadows: how much windows and icons darken the sky
-  float stars = 1.0f;         // Stars
+  float stars = 1.0f;         // Stars: 1 what the eye sees, above that fainter ones too
+  float meteors = 1.0f;       // Shooting stars: how often, 0 = never
   float moonlight = 1.0f;     // Moonlight: strength of the light at night
   float glow = 2.0f;          // HDR glow: brightness of the sun as a multiple of white, 1 = off
   float ground = 0.0f;        // Ground: 0 Mountains, 1 Skyline, 2 Sea
@@ -111,6 +136,12 @@ class Renderer {
   // follows gradually; otherwise it counts as a user change and is recomputed at
   // once.
   void setHeaven(const Heaven& h, bool gentle = false);
+  // The stars turn slowly: the image follows with its next frame, nothing starts
+  // over.
+  void setNight(const Night& n);
+  // Where a point of the sky is on the sheet of the stars, logical pixels:
+  // azimuth from north through east and altitude, degrees.
+  void skyPoint(double az, double alt, float& x, float& y) const;
   // Windows and sun in one, without moon.
   void setScene(const std::vector<Occluder>& list, float sunX, float sunY);
   // The image shows the sky compressed: a sun at the top edge is in reality at the
@@ -192,6 +223,20 @@ class Renderer {
   // There is lightning right now.
   bool flashing() const { return flash_.level > 0.001f; }
   float flashLevel() const { return flash_.level; }
+  // For still images: a shooting star from one place in the image to another
+  // (fractions of the image), of this magnitude, held at this part of its flight.
+  void meteorNow(float x0, float y0, float x1, float y1, float magnitude, float progress);
+  // A shooting star is in the image right now.
+  bool meteorsOn() const;
+  // The faintest magnitude visible at the zenith right now, and how many stars
+  // of the catalogue are drawn for it.
+  float starLimit() const { return nightDepth().limit; }
+  int starsDrawn() const;
+  // How many stars the catalogue holds, and its faintest magnitude.
+  int starCount() const { return int(starMag_.size()); }
+  float starsReach() const { return starMag_.empty() ? 0.0f : starMag_.back(); }
+  // Shooting stars per hour in the image, as things stand right now.
+  double meteorRate() const;
   // Rain at the viewer's location, 0 to 1.
   float rainHere() const { return rainHere_; }
   // Radius of the disk that is shining right now.
@@ -284,6 +329,23 @@ class Renderer {
     float wing[3] = {};                // birds: half width of the body, length of a wing, height of the wing root
     std::vector<Lamp> lamps;           // its lights for the night
   };
+  // How deep the eye sees into the night sky.
+  struct Depth {
+    float limit = -9;    // faintest magnitude visible at the zenith
+    float loss = 0.25f;  // magnitudes lost per air mass toward the horizon
+    float gain = 1;      // brightness of what is seen
+    float twinkle = 1;
+  };
+  // A shooting star.
+  struct Meteor {
+    double born = 0;                    // when it appeared
+    float from[2] = {}, to[2] = {};     // its path in the image, logical pixels
+    float seconds = 0.5f;               // of its flight
+    float fade = 0.1f;                  // seconds over which its trail fades
+    float magnitude = 2;
+    float tint = 0, flare = 0;
+    float held = -1;                    // for still images: it stays at this part of its flight
+  };
   // Which image the models are set into.
   enum class Into { EYE, LIGHT, MIRROR };
   // What of the image for the eye is made anew.
@@ -326,6 +388,11 @@ class Renderer {
   void drawBolt();
   void updateFlash();
   float chance();
+  bool loadStars();
+  Depth nightDepth() const;
+  double sheetScale() const;
+  void updateMeteors(double dt);
+  bool drawNight();
   bool loadGround();
   void makeWaves();
   void setSea();
@@ -412,6 +479,23 @@ class Renderer {
   int mapTick_ = 0;         // counts how often sums and shadows have been made since the last user change
   int columnTop_ = 0, columnH_ = 1;   // top row of this strip in upper_ and its height
   Target shade_;            // shadows of the clouds on the water, a quarter of the edge length
+
+  // The night sky. The stars of the catalogue are points in a vertex buffer, the
+  // brightest first; they, the Milky Way, the planets and shooting stars are drawn
+  // into stars_, which the finished image lays behind the clouds.
+  Night night_;
+  bool nightSet_ = false;
+  Microsoft::WRL::ComPtr<ID3D11VertexShader> vsWhole_, vsStar_, vsBody_, vsTrail_;
+  Microsoft::WRL::ComPtr<ID3D11PixelShader> psMilky_, psStar_, psTrail_;
+  Microsoft::WRL::ComPtr<ID3D11InputLayout> starLayout_;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> starBuf_, nightBuf_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> milky_;   // map of the Milky Way
+  std::vector<float> starMag_;     // magnitude of every star in the buffer, ascending
+  Target stars_;
+  double nightDrawn_ = -1e9;       // when stars_ was last drawn
+  bool nightDirty_ = true;         // it has to be drawn anew at once
+  bool nightShown_ = false;        // something is in it
+  std::vector<Meteor> meteors_;
 
   // Ships, aircraft, birds.
   Life life_;
