@@ -440,6 +440,13 @@ Sky skyOf(float clouds) {
 
 int groundOf(const Params& p) { return std::clamp(int(std::lround(p.ground)), 0, GROUND_COUNT - 1); }
 
+// How far the cumulus lean downwind for a position of the slider Wind: the
+// tangent of the angle, as cloudLean in shader\clouds.hlsli.
+double leanOf(double wind) {
+  wind = std::clamp(wind, 0.0, 1.0);
+  return 0.9 * wind * std::sqrt(wind);
+}
+
 // What follows from the temperature. Between freezing and two degrees above it,
 // rain turns into snow. Snow lies from the height at which the mean of the day
 // is at freezing; the air cools by 6.5 degrees per kilometer.
@@ -1089,6 +1096,7 @@ void Renderer::resize(int pixelW, int pixelH, float scale) {
     airZ_[i] = makeTarget(aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
     near_[i] = makeTarget((aw + 3) / 4, (ah + 3) / 4, DXGI_FORMAT_R16_FLOAT, false);
     airShiftOf_[i] = cloudT_;
+    airLeanOf_[i] = leanOf(par_.wind);
   }
   nearBlock_ = makeTarget((aw + 3) / 4, (ah + 3) / 4, DXGI_FORMAT_R16_FLOAT, false);
   airNew_ = 0, airOld_ = 2, airWork_ = 1;
@@ -1511,6 +1519,12 @@ void Renderer::setParams(const Params& p) {
              p.moonlight != par_.moonlight || p.ground != par_.ground;
   // The stars are an image of their own: only it is made anew.
   if (p.stars != par_.stars) nightDirty_ = faceDue_ = true;
+  // The wind shapes the clouds: the next passes count for more, so that the new
+  // shapes come in within a moment instead of over seconds. Nothing starts over.
+  if (p.wind != par_.wind) {
+    skyAccum_ = std::min(skyAccum_, 3);
+    shapeMoved_ = time_;
+  }
   bool res = p.resolution != par_.resolution;
   // The haze also lies between eye and ground: the finished image needs it anew,
   // the clouds do not. The same goes for fog and for what the temperature decides.
@@ -1555,6 +1569,7 @@ void Renderer::drift(float clouds, float wind) {
   if (!dev_ || !sky_.tex) return;
   updateLight();
   heavenMoved_ = true;
+  shapeMoved_ = time_;
   // If the clouds stand still, no new pass would be made otherwise.
   if (cloudsMoved && !(wind > 0 && clouds > 0)) skyAccum_ = std::min(skyAccum_, SKY_ACC / 2);
 }
@@ -1569,6 +1584,7 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.sunR = sunRadius();
   c.moonR = moonRad_;
   c.shape[0] = l.squash, c.shape[1] = l.moonSquash, c.shape[2] = par_.rays;
+  c.shape[3] = std::clamp(par_.wind, 0.0f, 1.0f);
   c.focal = focal();
   c.horizon = horizon();
   c.clouds = par_.clouds;
@@ -1644,6 +1660,9 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.wind[2] = foamOdds_;
   c.wind[3] = foamCover_;
   for (int i = 0; i < 3; i++) c.sunLand[i] = l.land[i], c.skyLand[i] = l.skyLand[i], c.sea[i] = g.sea[i];
+  // For the final image: how much more the newest cloud image leans than the one
+  // before, which is faded into it.
+  c.sea[3] = float(airLeanOf_[airNew_] - airLeanOf_[airOld_]);
   c.land[0] = l.alt;
   c.land[1] = wx.closed;
   c.land[2] = 0.45f + par_.density;
@@ -1781,12 +1800,19 @@ void Renderer::beginPass() {
   // If the light source moves fast (time lapse), the light of the clouds should
   // follow it instead of lagging for long: then the new counts more.
   float floor = std::clamp(pace_ / 60, 1.0f / SKY_ACC, 0.34f);
+  // The same while the weather reshapes the clouds (their cover, or the wind that
+  // leans and tears them) and shortly after: averaged over all passes, what a
+  // cloud has just lost stood beside it as a pale veil for many seconds.
+  if (time_ - shapeMoved_ < 2.5) floor = std::max(floor, 0.2f);
   pass_.share = first ? 1.0f : std::max(1.0f / (skyAccum_ + 1), floor);
   // The first pass after a user change with fewer steps, so that dragging the sun
   // stays smooth; the following ones refine it.
   pass_.steps = int(std::lround(CLOUD_STEPS * (first ? 0.6 : 1.0)));
   pass_.shift = float(cloudT_);
   pass_.evolve = float(evolveT_);
+  // The wind may change while the pass is under way (live weather): all its bands
+  // get the clouds of the wind it began with.
+  pass_.wind = std::clamp(par_.wind, 0.0f, 1.0f);
   // Every pass shifts the sampling pattern so that the remainder after averaging
   // does not form a fixed grid.
   pass_.jit = 5.588238f * float(skyShot_ % 64);
@@ -1819,6 +1845,10 @@ void Renderer::airBand() {
   c.share = std::abs(back) > 0.5 ? 1.0f : pass_.share;
   c.back = float(back);
   c.evolve = pass_.evolve;
+  // The clouds of the image that is read may lean differently: the history is
+  // looked up where they stood with that lean.
+  c.shape[3] = pass_.wind;
+  c.sea[3] = float(leanOf(pass_.wind) - airLeanOf_[airNew_]);
   ctx_->UpdateSubresource(skyBuf_.Get(), 0, nullptr, &c, 0, 0);
   ID3D11ShaderResourceView* in[5] = {noise_.Get(), air_[airNew_].srv.Get(), nullptr, airZ_[airNew_].srv.Get(), base_.srv.Get()};
   ctx_->PSSetShaderResources(0, 5, in);
@@ -1858,7 +1888,10 @@ void Renderer::bindClouds() {
 float Renderer::cloudDensity(double x, double z) const {
   if (weatherW_ <= 0) return 0;
   double shift = cloudT_ * CLOUD_TILE;
-  double u = (x + shift) / 100e3, v = (z + shift * 0.3) / 100e3;
+  // The clouds lean with the wind (cloudLean in clouds.hlsli): what is 400 m
+  // above the cloud base belongs to the column that far upwind.
+  double lean = leanOf(par_.wind) * (1150 - 750);
+  double u = (x + shift + 0.958 * lean) / 100e3, v = (z + shift * 0.3 + 0.287 * lean) / 100e3;
   u = (u - std::floor(u)) * weatherW_ - 0.5;
   v = (v - std::floor(v)) * weatherH_ - 0.5;
   int x0 = int(std::floor(u)), y0 = int(std::floor(v));
@@ -3135,6 +3168,7 @@ bool Renderer::stepBand() {
   if (pass_.band < AIR_BANDS) return false;
   drawNear(airWork_);
   airShiftOf_[airWork_] = pass_.shift;
+  airLeanOf_[airWork_] = leanOf(pass_.wind);
   int oldest = airOld_;
   airOld_ = airNew_;
   airNew_ = airWork_;

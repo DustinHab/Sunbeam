@@ -32,6 +32,31 @@ static const float CL_GAIN = 1.8;           // brightness of the sunlight in the
 static const float CL_SKY = 0.2;            // fraction of the sky light
 static const float CL_FAR = 60e3;           // clouds farther away are not computed
 
+// Wind shapes the cumulus (uShape.w: the slider Wind, 0 to 1).
+// It blows harder higher up, so the top of a cloud runs ahead of its base: the
+// cloud leans downwind, hardly at all in a breeze, by 40 degrees in a storm.
+// And from a fresh wind on it tears at them: the noise eats deeper into them,
+// the edges fray, and the firm domes of a calm day give way to ragged tops. All
+// of it is a fixed deformation of the cloud field, which still drifts as a
+// whole: nothing in it moves against the rest.
+static const float2 DOWNWIND = float2(-0.958, -0.287);   // where the cumulus drift to (right, ahead): against WIND, which shifts the field
+static const float LEAN_MAX = 0.9;          // tangent of the lean at full wind, as in render.cpp
+
+// Tangent of the angle by which the cumulus lean.
+float cloudLean() {
+  return LEAN_MAX * uShape.w * sqrt(uShape.w);
+}
+
+// How hard the wind tears at the clouds: 0 up to half the slider, 1 at its end.
+float cloudGale() {
+  return saturate(2.0 * uShape.w - 1.0);
+}
+
+// And how calm it is: 1 without wind, 0 from half the slider on.
+float cloudCalm() {
+  return saturate(1.0 - 2.0 * uShape.w);
+}
+
 struct Weather {
   float3 hf;     // height within each layer, 0 to 1
   float3 dens;   // density per layer according to the weather map
@@ -65,7 +90,13 @@ Weather cloudWeather(float3 pos, float mip, float lift) {
   Weather w;
   float h = length(pos) - R_PLANET - EYE_ALT;
   w.P = float3(pos.x, h, pos.z) + cloudShift * CL_TILE * windAt(h);
-  w.uv = w.P.xz / WEATHER_TILE;
+  // The lean: what is at this height belongs to the column that stands this far
+  // upwind at the cloud base. Only the map is read there; the noise that gives
+  // the clouds their billows stays upright, or every billow would be drawn out
+  // into a streak. The cirrus far above is too thin to lean.
+  float2 column = w.P.xz;
+  if (h < 4500.0) column -= DOWNWIND * (cloudLean() * max(h - CUMULUS_LO, 0.0));
+  w.uv = column / WEATHER_TILE;
   w.hf = saturate((h - LAYER_LO) / (LAYER_HI - LAYER_LO));
   float3 lw = (mip < 0.0 ? weatherSmooth(w.uv) : tWeather.SampleLevel(sWrap, w.uv, mip).rgb) + lift;
   // Clouds round off toward the top: there the map has to yield more.
@@ -83,22 +114,29 @@ Weather cloudWeather(float3 pos, float mip, float lift) {
 // to 1 at the top, for the sky light.
 float cloudMedia(Weather w, bool fine, float lod, out float grad) {
   float3 dens = w.dens;
-  // Turbulence bends the lower third: wisps hang there.
+  float gale = cloudGale(), calm = cloudCalm();
+  // Turbulence bends the lower third: wisps hang there, more of them in a storm,
+  // hardly any in a calm. It is read straight down, not along the leaning
+  // column, and it must not reach far up: it is the same all along its line, and
+  // slanted through the whole cloud that shows as streaks, as if the cloud were
+  // smeared.
   // The turbulence map jumps from point to point; read at full resolution it would
   // tear the clouds into shreds with hard edges.
-  float3 turb = (tTurb.SampleLevel(sWrap, w.uv * TURB_REPEAT, 1.6).rgb * 2.0 - 1.0)
-              * (TURB_DISP * dot(dens, saturate(1.0 - w.hf / 0.3)));
+  float3 swirl = tTurb.SampleLevel(sWrap, w.P.xz * (TURB_REPEAT / WEATHER_TILE), 1.6).rgb * 2.0 - 1.0;
+  float3 turb = swirl * (TURB_DISP * (1.0 + 0.3 * gale - 0.4 * calm) * dot(dens, saturate(1.0 - w.hf / (0.3 + 0.1 * gale))));
   // The shape changes over time: the noise slowly sinks through the clouds.
   float3 at = w.P + turb;
   float shape = tShape.SampleLevel(sWrap, (at - float3(0.0, cloudAge * EVOLVE_M, 0.0)) * SHAPE_REPEAT, lod).r;
-  float3 lo = (1.0 - shape) * LAYER_SHAPE;
+  // A storm eats deeper into them: more gaps, smaller pieces.
+  float3 lo = (1.0 - shape) * LAYER_SHAPE * (1.0 + 0.3 * gale);
   // At the outermost edge of a cloud field, where the map yields almost nothing,
   // only the peaks of the noise would otherwise remain: nothing but isolated dots.
   dens = saturate((dens - lo) / max(1.0 - lo, 1e-4)) * smoothstep(0.0, 0.16, w.dens);
   if (fine) {
     float detail = tDetail.SampleLevel(sWrap, at * DETAIL_REPEAT, 0.0).r;
-    // Billowing at the top, wispy at the bottom.
-    float3 m = lerp(pow(detail, 6.0), 1.0 - detail, saturate((w.hf - 0.2) / 0.2)) * LAYER_DETAIL * 0.5;
+    // Billowing at the top, wispy at the bottom. A storm frays the edges more; in a
+    // calm they stay firm.
+    float3 m = lerp(pow(detail, 6.0), 1.0 - detail, saturate((w.hf - 0.2) / 0.2)) * LAYER_DETAIL * (0.5 + 0.3 * gale - 0.12 * calm);
     dens = saturate((dens * 2.0 - m) / max(1.0 - m, 1e-4));
   }
   // Cirrus is fibrous: long, thin strands across the wind, almost nothing in

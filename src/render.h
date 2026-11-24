@@ -268,6 +268,7 @@ class Renderer {
     float share = 1;
     int steps = 0;
     float shift = 0, jit = 0, subX = 0, subY = 0, evolve = 0;
+    float wind = 0;   // the wind that shapes the clouds of this pass: the same for all its bands
     int band = 0;
   };
   // A window over time: whether it is moving right now, has just appeared or has
@@ -523,6 +524,8 @@ class Renderer {
   Target nearBlock_; // intermediate stage for that
   int airNew_ = 0, airOld_ = 2, airWork_ = 1;
   double airShiftOf_[3] = {};   // wind shift for which each of the images applies
+  double airLeanOf_[3] = {};    // and how far its cumulus lean with the wind (tangent)
+  double shapeMoved_ = -1e9;    // when the weather last changed the shapes of the clouds
   int airDone_ = 0;             // finished passes since the last user change
   int sinceSwitch_ = 0;         // frames since the last finished pass
   float fade_ = 1;              // fraction of the newest cloud image when cross-fading

@@ -1729,8 +1729,6 @@ int runDrift(const std::wstring& dir, int viewW, int viewH, float scale) {
   Params p;
   double shift = -1;
   readValues(dir, log, p, shift);
-  Params calm = p;
-  calm.wind = 0;
   std::vector<Occluder> scene;
   scene.push_back({0, float(viewH) - 48, float(viewW), float(viewH), 0, 0.88f, 2});
   std::vector<uint8_t> mask(size_t(pw) * ph, 0);
@@ -1744,7 +1742,9 @@ int runDrift(const std::wstring& dir, int viewW, int viewH, float scale) {
   }
   for (Renderer* r : {&moving, &still}) {
     r->resize(pw, ph, scale);
-    r->setParams(r == &moving ? p : calm);
+    // Both with the same wind: it shapes the clouds. The one at rest stands still
+    // because no time passes for it.
+    r->setParams(p);
     r->setScene(scene);
     r->setIconMask(mask.data(), pw, ph);
     r->setHeaven(heavenOfHand(sunX * viewW, sunY * viewH, bodiesAt(1795478400.0, 52.5, 13.4), *r));

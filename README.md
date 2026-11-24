@@ -37,8 +37,10 @@ windows.
 - **Clouds** in three layers with volume and their own shadows. One slider
   goes from a clear sky through overcast and rain to a thunderstorm with
   lightning. Lightning lights clouds, rain and the desktop the way the sun does.
-- **Wind** moves the clouds (the high layer on a wind of its own), slants the
-  rain, raises the sea and carries the dust in the light shafts.
+- **Wind** moves the clouds (the high layer on a wind of its own) and shapes
+  them: firm domes in a calm, leaning downwind as it freshens, torn into
+  ragged pieces in a storm. It slants the rain, raises the sea and carries the
+  dust in the light shafts.
 - **Cold**: around freezing, snow falls instead of rain. In the mountains snow
   lies above a snow line that follows the temperature, down to a white winter
   panorama; in the city it lies on roofs. Without a temperature of your own the

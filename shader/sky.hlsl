@@ -54,7 +54,7 @@ cbuffer SkyC : register(b0) {
   float uFade;       // share of the newest cloud image when cross-fading
   float3 uAfter;     // afterglow above the horizon once the sun has set
   float uMoonR;      // radius of the moon disc; uSunR is the radius of the light source
-  float4 uShape;     // x: squash of the light source at the horizon, y: of the moon, z: ray spikes around the sun
+  float4 uShape;     // x: squash of the light source at the horizon, y: of the moon, z: ray spikes around the sun, w: the slider Wind, 0 to 1 (it shapes the clouds)
   float4 uGround;    // x: 1 = land from the strip, y: 1 = water, z: eye above the water in m, w: eye above sea level in m
   float4 uStrip;     // x: tangent of the upper edge of the strip, y: of its full height, z: how brightly the city lights burn, w: how far the gust patches have moved across the water, meters
   float3 uSunLand;   // light of the light source on a bright surface facing it
@@ -62,7 +62,7 @@ cbuffer SkyC : register(b0) {
   float3 uSkyLand;   // sky light on a bright surface under open sky
   float uCloudLift;  // this many meters higher than usual the clouds lie above the viewer (over mountains, so that the summits stay clear)
   float4 uLand;      // x: true elevation of the light source in radians, y: how overcast the sky is, z: haze, w: 1 = the land has lights and glass
-  float4 uSea;       // color of the light that returns from the water
+  float4 uSea;       // color of the light that returns from the water; w: how much more the cumulus lean than in the cloud image that is read (while clouds are computed: the newest; in the final image: the one before it)
   float4 uStorm;     // x: storm darkness of the clouds, y: rain overall, z: rain at the viewer's location, w: time for the rain streaks (wraps after 64 s)
   float4 uFlash;     // lightning: position relative to the eye in meters, w: brightness now
   float4 uFlashCol;  // its color, w: number of segments of its channel (0 = sheet lightning without a channel)
@@ -339,14 +339,20 @@ float2 depthSoft(Texture2D tex, float2 u) {
 // height (driftOf): the cirrus at the very top is driven by a different wind.
 // zTex: the distances of that image, nearTex: the same, coarse and extended into
 // the neighborhood. zOld: the distance that the content had there.
-float3 driftOf(float3 d, float z, float back) {
+// lean: how much more the cumulus lean now than in that image (tangent). If the
+// wind has changed since, what is high up in a cloud stood closer to its base
+// then, or farther from it.
+float3 driftOf(float3 d, float z, float back, float lean) {
   float3 at = float3(0.0, R_PLANET + EYE_ALT - uCloudLift, 0.0) + d * (z * 1000.0);
-  return back * CL_TILE * windAt(length(at) - R_PLANET - EYE_ALT);
+  float h = length(at) - R_PLANET - EYE_ALT;
+  float3 was = back * CL_TILE * windAt(h);
+  if (h < 4500.0) was.xz -= DOWNWIND * (lean * max(h - CUMULUS_LO, 0.0));
+  return was;
 }
 
-float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float back, out float zOld) {
+float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float back, float lean, out float zOld) {
   zOld = z;
-  if (abs(back) < 1e-7 || d.y <= 0.004) return uv;
+  if ((abs(back) < 1e-7 && abs(lean) < 1e-6) || d.y <= 0.004) return uv;
   if (z <= 0.0) {
     z = depthAt(nearTex, uv);
     if (z <= 0.0) {
@@ -357,7 +363,7 @@ float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z
       float3 o = float3(0.0, R_PLANET + EYE_ALT - uCloudLift, 0.0);
       z = raySphere(o, d, R_PLANET + EYE_ALT + 1300.0).y * 0.001;
     } else {
-      float3 N = d * (z * 1000.0) + driftOf(d, z, back);
+      float3 N = d * (z * 1000.0) + driftOf(d, z, back, lean);
       if (N.z <= 1.0) return float2(-1.0, -1.0);
       float zn = length(N) * 0.001, zs = depthAt(zTex, airUv(pointOf(N)));
       if (!(zs > 0.0 && abs(zs - zn) < 0.3 * zn)) {
@@ -368,7 +374,7 @@ float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z
       }
     }
   }
-  float3 P = d * (z * 1000.0) + driftOf(d, z, back);
+  float3 P = d * (z * 1000.0) + driftOf(d, z, back, lean);
   if (P.z <= 1.0) return float2(-1.0, -1.0);
   zOld = length(P) * 0.001;
   return airUv(pointOf(P));
@@ -486,7 +492,7 @@ AirOut Air(float4 pos : SV_Position) {
     // The history is looked up for the center of the pixel, not for the offset
     // sample of this pass: otherwise it would be read shifted by a fraction on every
     // pass and would blur over time.
-    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, zOld);
+    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, uSea.w, zOld);
     if (uvOld.x > 0.0 && uvOld.y > 0.0 && uvOld.x < 1.0 && uvOld.y < 1.0) {
       was = cloudSharp(uvOld);
       zWas = depthAt(tCloudZ, uvOld);
@@ -705,7 +711,7 @@ float snowFall(float2 p) {
 void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   float zThere;
   float2 au = airUv(p);
-  float2 from = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, zThere);
+  float2 from = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, 0.0, zThere);
   cloud = tCloud.SampleLevel(sClamp, from, 0.0);
   // Distance of the clouds at this position in km, 0 = none: by this they lie in
   // front of or behind the land.
@@ -713,7 +719,9 @@ void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   // Where none is known at this position itself, that of the clouds around it.
   if (cloudZ.x <= 0.0) cloudZ = float2(tNear.SampleLevel(sClamp, from, 0.0).r, 0.0);
   if (uFade < 0.999) {
-    from = cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, zThere);
+    // The image before may have been made in a different wind: its clouds are set
+    // to the lean of the newest one, so that the two fade into each other in place.
+    from = cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, uSea.w, zThere);
     float4 older = tCloudOld.SampleLevel(sClamp, from, 0.0);
     float2 zOlder = depthSoft(tCloudZOld, from);
     if (zOlder.x <= 0.0) zOlder = float2(tNearOld.SampleLevel(sClamp, from, 0.0).r, 0.0);
