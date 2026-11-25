@@ -90,8 +90,9 @@ void Life::startBoat(const Surroundings& s) {
   a.on = true;
   a.prop.model = MODEL_DINGHY;
   double dir = rnd() < 0.5 ? -1 : 1;
-  // Not so near that one would look for its crew.
-  double z = s.ground == 1 ? rnd(700, 1500) : rnd(900, 2400);
+  // At times near enough to make out its crew; nearer still it would sit below the
+  // bottom edge of the image.
+  double z = s.ground == 1 ? rnd(550, 1400) : rnd(420, 1800);
   double heading = dir * (PI / 2 - rnd(-0.3, 0.3));
   double upwind = std::atan2(-s.windX, -s.windZ);
   double off = wrap(heading - upwind);
@@ -201,6 +202,7 @@ bool Life::gone(const Actor& a, const Surroundings& s) const {
 void Life::travel(Actor& a, double dt) {
   a.age += dt;
   for (int i = 0; i < 3; i++) a.prop.pos[i] = a.from[i] + a.velocity[i] * a.age;
+  a.prop.speed = float(std::hypot(a.velocity[0], a.velocity[2]));
 }
 
 // A gull: its straight course sways sideways and up and down, it banks into the
@@ -241,6 +243,7 @@ const std::vector<Prop>& Life::update(double dt, const Surroundings& s) {
     for (Staged& g : staged_) {
       for (int i = 0; i < 3; i++) g.prop.pos[i] += g.velocity[i] * dt;
       Prop p = g.prop;
+      p.speed = float(std::hypot(g.velocity[0], g.velocity[2]));
       double beat = time_ * 3.2 * 2 * PI;
       p.wing += float(WING_REST + g.flap * BEAT * std::sin(beat));
       p.tip += float(TIP_REST + g.flap * TIP_BEAT * std::sin(beat - 1.0));

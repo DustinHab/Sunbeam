@@ -21,6 +21,24 @@ windows.
 
 ![Milky Way, stars and a shooting star in a summer night, a detail at full resolution](docs/night_sky.jpg)
 
+![A veil of cirrostratus with a halo and sun dogs, a freighter at the horizon and a dinghy with its crew](docs/halo.jpg)
+
+## Install
+
+Download `SunbeamSetup.exe` from the
+[latest release](https://github.com/DustinHab/Sunbeam/releases/latest) and run
+it. It needs no administrator rights and asks one thing: whether Sunbeam starts
+with Windows. Sunbeam then starts, and its settings open once.
+
+Windows may warn that the file comes from an unknown publisher, because it is
+not signed: choose **More info**, then **Run anyway**.
+
+Without installing: `Sunbeam.exe` from the same release runs from any folder,
+it needs no other files.
+
+To remove it: Settings, Apps, Installed apps, Sunbeam. The settings in
+`%LOCALAPPDATA%\Sunbeam` stay.
+
 ## What it does
 
 - **Sun and moon** follow the clock for a place of your choice, stand where you
@@ -37,10 +55,15 @@ windows.
 - **Clouds** in three layers with volume and their own shadows. One slider
   goes from a clear sky through overcast and rain to a thunderstorm with
   lightning. Lightning lights clouds, rain and the desktop the way the sun does.
-- **Wind** moves the clouds (the high layer on a wind of its own) and shapes
-  them: firm domes in a calm, leaning downwind as it freshens, torn into
-  ragged pieces in a storm. It slants the rain, raises the sea and carries the
-  dust in the light shafts.
+- **Cirrus** has a slider of its own: single strands of ice high up, and from
+  about half on a milky veil of cirrostratus. Its crystals put a ring of 22
+  degrees around sun and moon, reddish on the inside, and sun dogs beside them
+  that move out as the sun climbs.
+- **Wind** moves the clouds (the high layer on a wind of its own, turned against
+  the one below) and shapes them: firm domes in a calm, leaning downwind as it
+  freshens, torn into ragged pieces in a storm. It slants the rain, raises the
+  sea and carries the dust in the light shafts. Its direction is a slider of its
+  own, given as the compass point it blows from.
 - **Cold**: around freezing, snow falls instead of rain. In the mountains snow
   lies above a snow line that follows the temperature, down to a white winter
   panorama; in the city it lies on roofs. Without a temperature of your own the
@@ -53,27 +76,29 @@ windows.
   day; the city switches its lights on at dusk.
 - **Water** reflects sky and land, shows the glitter path of sun and moon, cloud
   shadows, swell, whitecaps in fresh wind and the lights of the city as long
-  columns.
-- **Life**, rarely: a ship at the sea horizon, a sailing dinghy when the wind
-  suits, an airliner, a few gulls. They lie in the haze, behind clouds and rain
-  according to their distance, are mirrored in the water and carry lights at
-  night. Most of the time the image is empty; a slider sets how often something
-  passes.
+  columns. Ships and boats leave a wake: a bow wave, a white trail that smooths
+  into a long calm band, and Kelvin's wedge of waves.
+- **Life**, rarely: a ship at the sea horizon, a sailing dinghy with its crew
+  when the wind suits, an airliner, a few gulls. They cast shadows onto
+  themselves, lie in the haze, behind clouds and rain according to their
+  distance, are mirrored in the water and carry lights at night. Most of the
+  time the image is empty; a slider sets how often something passes.
 - **Light**: a click-through layer above all windows adds scattered light and
   shadows, rim light on window edges and dust. HDR displays are supported.
   The light stays on a window while it is dragged, and on the mouse pointer:
   their positions are read a thousand times a second and computed ahead to
   the display refresh in which the frame appears.
-- **Live weather** (optional) sets clouds, rain or snow, thunderstorms, wind,
-  fog and temperature from the current weather at your place.
+- **Live weather** (optional) sets clouds and cirrus, rain or snow,
+  thunderstorms, wind and its direction, fog and temperature from the current
+  weather at your place.
 
 Sunbeam rests while a full-screen application or a maximized window covers the
 desktop, and leaves the graphics card to it.
 
 ## Requirements
 
-Windows 11 and a Direct3D 11 graphics card. Developed and tested on Windows 11
-25H2 with one display (3840 x 2160 at 150 % scaling, SDR and HDR) and an NVIDIA
+Windows 10 or 11 (64-bit) and a Direct3D 11 graphics card. Developed and tested
+on Windows 11 25H2 with one display (3840 x 2160 at 150 % scaling, SDR and HDR) and an NVIDIA
 RTX 4070; other setups are untested. Only the primary display is used.
 
 The program renders continuously while the desktop is visible. On the
@@ -103,6 +128,11 @@ build.bat
 The result is `out\Sunbeam.exe`; it has no other files to ship. `build.bat
 shader` compiles only the shaders.
 
+The setup is made from it with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
+`ISCC.exe installer\Sunbeam.iss` writes `out\SunbeamSetup.exe`. Pushing a tag
+`v*` makes GitHub build both and publish them as a release
+(`.github\workflows\release.yml`).
+
 ## Use
 
 Start `Sunbeam.exe`. It adds an icon to the notification area:
@@ -112,6 +142,7 @@ Start `Sunbeam.exe`. It adds an icon to the notification area:
   Windows, quit.
 - The sun (or the moon at night) can be dragged on the desktop.
 - Ctrl+Alt+Shift+Q quits from anywhere.
+- Starting it again while it runs opens the settings window.
 
 Settings are stored in `%LOCALAPPDATA%\Sunbeam\sunbeam.ini`. The file can be
 edited while the program runs; changes apply when it is saved. A log is written
@@ -199,7 +230,8 @@ card.
 | `ground\`, `clouds\`, `images\`, `models\`, `stars\` | Data built into the program |
 | `tools\ground\` | Scripts that produced the ground strips |
 | `tools\stars\` | Script that converted the star catalogue and the map of the Milky Way |
-| `tools\models\` | Script that converted the models |
+| `tools\models\` | Script that converted the models and set the crew into the dinghy |
+| `installer\` | Setup script and the text of a release |
 
 ## Limits
 
@@ -218,16 +250,15 @@ card.
   reality; the showers keep their true rates. The built-in catalogue ends near
   magnitude 7: without a larger one (see "More stars") the slider Stars above
   100 % makes the sky brighter, not deeper.
-- Wind direction is fixed; live weather sets only its strength.
 - No sound.
 - Snow lies on the land but does not pile up on ships or freeze the water; the
   season knows the latitude, not the climate of a particular place.
 - Fog is a level layer with banks; it has no relief when seen from above.
 - Water is a flat surface with tilted reflections; tall waves do not hide what
-  is behind them.
+  is behind them, and the wake raises no waves that a boat would rock in.
 - The skyline is missing one tower that was built after the lidar scan of 2017.
-- Ships leave no wake, the dinghy sails without a crew, and nothing casts a
-  shadow onto itself.
+- Of the halos only the ring of 22 degrees and the sun dogs appear; arcs and
+  pillars do not.
 
 ## Credits and licence
 
@@ -235,6 +266,5 @@ Sunbeam is released under the [MIT licence](LICENSE). It uses methods, code and
 data from others, among them three-geospatial (clouds), the ocean lighting
 method of Bruneton, Neyret and Holzschuch, swisstopo, the U.S. Geological
 Survey, OpenStreetMap, NASA, the Bright Star Catalogue and Open-Meteo, and
-models by RM02, hungry_drifter,
-MesXwi, Julian Johnson-Mortimer and mgg8, which keep their own licences (CC BY
-4.0 and CC0). The full list with licences is in [CREDITS.md](CREDITS.md).
+models by RM02, hungry_drifter, MesXwi, Julian Johnson-Mortimer, mgg8 and
+Quaternius, which keep their own licences (CC BY 4.0 and CC0). The full list with licences is in [CREDITS.md](CREDITS.md).

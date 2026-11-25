@@ -13,7 +13,11 @@
   },
   "dinghy": {
     "source": "yacht", "forward": "-X", "up": "+Z", "draft": 0.19, "triangles": 45000, "layer": 128, "thin": ["canvas"],
-    "lights": [["allround", 0.0, 8.1, 0.2]]
+    "lights": [["allround", 0.0, 8.1, 0.2]],
+    "crew": [{"source": "quaternius_man/man.glb", "forward": "-Y", "up": "+Z", "action": "Man_Sitting", "frame": 120, "height": 1.78,
+              "at": [0.66, 0.88, -2.15], "turn": -90, "colors": {"Shirt": [0.42, 0.02, 0.015], "Pants": [0.015, 0.02, 0.04]}},
+             {"source": "quaternius_man/man.glb", "forward": "-Y", "up": "+Z", "action": "Man_Sitting", "frame": 120, "height": 1.72,
+              "at": [0.70, 0.88, -1.35], "turn": -90, "colors": {"Shirt": [0.75, 0.42, 0.01], "Pants": [0.02, 0.02, 0.025], "Hair": [0.2, 0.12, 0.05]}}]
   },
   "airliner": {
     "source": "boeing_737-200__european_aviation_g-ceah", "forward": "-Y", "up": "+Z", "skip": ["Object_15"], "triangles": 60000, "layer": 128,

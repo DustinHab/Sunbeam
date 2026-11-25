@@ -10,8 +10,11 @@
 struct WeatherNow {
   bool valid = false;
   float cover = 0;        // cloud cover, 0 to 1
+  float high = 0;         // of it the high clouds (cirrus), 0 to 1
+  float low = -1, mid = -1;   // the low and the middle ones; negative: not reported
   float rain = 0;         // precipitation in mm per hour
   float wind = 0;         // wind at 10 m height, m/s
+  float windDir = 253.3f; // where it comes from, degrees from north through east
   float gust = 0;         // gusts, m/s
   float temperature = 0;  // degrees Celsius
   float dayTemperature = 0;   // mean of the day
@@ -24,9 +27,9 @@ struct WeatherNow {
 // The air cools by this much per meter of height.
 const double LAPSE = 0.0065;
 
-// Positions of the sliders for this weather: Clouds 0 to 2, Wind 0 to 1.
-// Whether what falls is rain or snow follows from the temperature.
-void weatherSliders(const WeatherNow& w, float& clouds, float& wind);
+// Positions of the sliders for this weather: Clouds 0 to 2, Wind and Cirrus 0
+// to 1. Whether what falls is rain or snow follows from the temperature.
+void weatherSliders(const WeatherNow& w, float& clouds, float& wind, float& cirrus);
 
 // Position of the slider Fog for a visibility in meters: none from FOG_FROM
 // upward, full at FOG_TO. And back. The lower part of the slider is stretched

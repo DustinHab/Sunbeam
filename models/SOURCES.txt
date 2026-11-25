@@ -23,6 +23,11 @@ dinghy.mesh, dinghy.png
   https://sketchfab.com/3d-models/yacht-ae42c1609c25412cbfe40baf9728d987
   Licence: CC BY 4.0, http://creativecommons.org/licenses/by/4.0/
   The program also shows it mirrored, with the sails on the other side.
+  Its crew, two figures in it:
+  "Man" by Quaternius (https://quaternius.com)
+  https://poly.pizza/m/HMnuH5geEG
+  Licence: CC0 1.0, http://creativecommons.org/publicdomain/zero/1.0/
+  Posed sitting, on the windward side, in jackets of their own colours.
 
 airliner.mesh, airliner.png
   "Boeing 737-200 - European Aviation G-CEAH" by mgg8 (https://sketchfab.com/mgg8)

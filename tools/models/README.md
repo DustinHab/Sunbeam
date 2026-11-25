@@ -2,7 +2,7 @@
 
 `convert.py` turns the models that move through the image (ships, a dinghy, an airliner, a gull) from glTF into the meshes and colour sheets in `models\` at the repository root. It is only needed to convert them again, for instance after changing `models.json`.
 
-1. Download the models named in `models\SOURCES.txt` from Sketchfab as glTF and unpack each archive into a folder of its own inside one common folder. The folder names are the `source` entries in `models.json`.
+1. Download the models named in `models\SOURCES.txt` from Sketchfab as glTF and unpack each archive into a folder of its own inside one common folder. The folder names are the `source` entries in `models.json`. The crew of the dinghy is the glTF download of "Man" from poly.pizza, saved there as `quaternius_man\man.glb`.
 2. Run the conversion with Blender 4.x in the background. Without names it converts all models.
    ```
    blender --background --factory-startup --python tools\models\convert.py -- <folder with the sources> [name ...]

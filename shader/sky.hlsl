@@ -21,7 +21,7 @@ cbuffer SkyC : register(b0) {
   float uClouds;
   float uNight;
   float uDay;
-  float uCloudT;
+  float uCirrus;     // the slider Cirrus, 0 to 1: high ice clouds, from about half on a closed veil
   float uJit;
   float3 uSunCol;    // light of the light source at the ground
   float uExposure;
@@ -32,7 +32,7 @@ cbuffer SkyC : register(b0) {
   float uSpan;       // in the final image: top row of the summed strip in the mirror image
   float uCount;      // and its height in rows
   float uShare;      // share of the new pass in the averaged cloud image
-  float uBack;       // wind shift since the image that is read from, in tiles
+  float uUnusedB;
   float uEvolve;     // time by which the shapes of the clouds change
   float uSkyGain;    // strength of the light source for the scattered light of the air: sun 1, moon a fraction
   float uTime;
@@ -50,19 +50,19 @@ cbuffer SkyC : register(b0) {
   float3 uFill;      // multiply scattered light that fills the sky far from the light source
   float uCover;      // cloud cover: how much of the weather map becomes clouds
   float2 uMoon;      // position of the moon in the image
-  float uBackOld;    // the same as uBack, for the cloud image before that
+  float uUnusedC;
   float uFade;       // share of the newest cloud image when cross-fading
   float3 uAfter;     // afterglow above the horizon once the sun has set
   float uMoonR;      // radius of the moon disc; uSunR is the radius of the light source
   float4 uShape;     // x: squash of the light source at the horizon, y: of the moon, z: ray spikes around the sun, w: the slider Wind, 0 to 1 (it shapes the clouds)
   float4 uGround;    // x: 1 = land from the strip, y: 1 = water, z: eye above the water in m, w: eye above sea level in m
-  float4 uStrip;     // x: tangent of the upper edge of the strip, y: of its full height, z: how brightly the city lights burn, w: how far the gust patches have moved across the water, meters
+  float4 uStrip;     // x: tangent of the upper edge of the strip, y: of its full height, z: how brightly the city lights burn, w: unused
   float3 uSunLand;   // light of the light source on a bright surface facing it
   float uPass;       // 1: only sky and land, without water (the image that is mirrored in the water)
   float3 uSkyLand;   // sky light on a bright surface under open sky
   float uCloudLift;  // this many meters higher than usual the clouds lie above the viewer (over mountains, so that the summits stay clear)
   float4 uLand;      // x: true elevation of the light source in radians, y: how overcast the sky is, z: haze, w: 1 = the land has lights and glass
-  float4 uSea;       // color of the light that returns from the water; w: how much more the cumulus lean than in the cloud image that is read (while clouds are computed: the newest; in the final image: the one before it)
+  float4 uSea;       // color of the light that returns from the water
   float4 uStorm;     // x: storm darkness of the clouds, y: rain overall, z: rain at the viewer's location, w: time for the rain streaks (wraps after 64 s)
   float4 uFlash;     // lightning: position relative to the eye in meters, w: brightness now
   float4 uFlashCol;  // its color, w: number of segments of its channel (0 = sheet lightning without a channel)
@@ -71,6 +71,16 @@ cbuffer SkyC : register(b0) {
   float4 uSnow;      // x: fraction of what falls that is snow, y: height above the sea from which snow lies, z: snow on the ground at the viewer's level (0 to 1), w: slant of the snowfall
   float4 uFog;       // fog: x extinction per meter in the layer, y height of its top above the sea, z depth of the transition at the top, w how much it lies in banks (0 to 1)
   float4 uFogCol;    // its own light before exposure; w: strength of the glare around the light source
+  // The wind. Directions are given in the frame of the image: x to the right, y
+  // ahead into the image.
+  float4 uDrift;     // how far the wind has shifted the cloud field, meters: xy for the cumulus, zw for the cirrus
+  float4 uBack;      // how far it has shifted them since the newest stored cloud image (while clouds are computed: since the one that is read), likewise
+  float4 uBackOld;   // and since the one before it
+  float4 uWindVec;   // the shift per unit along the wind, meters: xy cumulus, zw cirrus (for the search for a start)
+  float4 uLean;      // xy: how far the cumulus lean, meters sideways per meter of height; zw: how much more than in the stored image that is read (see cloudFrom)
+  float4 uSurf;      // xy: where the wind at the ground blows to, unit vector; zw: the direction the waves follow (it follows the wind in steps)
+  float4 uGust;      // xy: how far the banks of fog have drifted with the wind at the ground, meters; z: how far the gust fields have moved across the water along the direction of the waves
+  float4 uWake[4];   // up to two ships or boats under way, two entries each: position (x, ahead) and direction of travel; speed in m/s, half length, half beam, 1 (0: none)
 };
 
 // The lightning channel as a sequence of short segments in the image.
@@ -97,7 +107,7 @@ Texture2D tColumn : register(t24);  // the strip above the horizon, summed from 
 Texture2D tNight : register(t27);   // the night sky: Milky Way, stars, planets, shooting stars; their light as it enters the image
 Texture2D tFlow : register(t29);    // where what is now in the cloud image was in the stored ones (see Flow)
 
-static float cloudShift;   // shift of the clouds by the wind, in tiles
+static float4 cloudDrift;  // shift of the cloud field by the wind, meters (see uDrift)
 static float cloudAge;     // time by which their shapes change
 static float lightJit;     // offsets the path of the light to the sun per pixel and pass
 
@@ -112,19 +122,12 @@ static const float G_MIE = 0.5;       // wide: the narrow aureole around the sun
 static const float SUN_E = 22.0;
 static const float3 NIGHT = float3(0.0035, 0.006, 0.014);
 
-static const float CL_TILE = 6400.0;    // meters of wind shift per unit of cloudShift
-static const float3 WIND = float3(1.0, 0.0, 0.3);   // direction of the wind; this far per tile of shift
-// The cirrus at seven kilometers altitude is driven by a different wind: faster
-// and rotated by 30 degrees.
-static const float3 WIND_HIGH = float3(1.75, 0.0, -0.45);
-
-// The wind at height h above the ground. Each layer moves as a whole.
-float3 windAt(float h) {
-  return h > 4500.0 ? WIND_HIGH : WIND;
+// The cirrus far above is driven by a wind of its own: faster and turned by 30
+// degrees. Each layer moves as a whole. The shift of the cloud field at height h
+// above the ground, meters.
+float3 driftAt(float h) {
+  return h > 4500.0 ? float3(cloudDrift.z, 0.0, cloudDrift.w) : float3(cloudDrift.x, 0.0, cloudDrift.y);
 }
-// The wind at the ground: rotated by 25 degrees against the drift of the clouds,
-// toward the viewer (right, ahead). As in render.cpp.
-static const float2 SURF = float2(-0.747, -0.665);
 
 // The clouds are computed slightly wider than the image on both sides: what the
 // wind carries in from the side has then already been averaged over many passes
@@ -331,7 +334,7 @@ float2 depthSoft(Texture2D tex, float2 u) {
 }
 
 // Where in a stored cloud image was what is now visible in view direction d?
-// Since that image the clouds have moved with the wind by back tiles, the
+// Since that image the clouds have moved with the wind by back meters, the
 // farther in the image the nearer they are. z: their distance in km; 0 if no
 // cloud is known at this position. Then the distance of the frontmost cloud in
 // the neighborhood applies: its edge and the sky right beside it move with it.
@@ -340,22 +343,23 @@ float2 depthSoft(Texture2D tex, float2 u) {
 // height (driftOf): the cirrus at the very top is driven by a different wind.
 // zTex: the distances of that image, nearTex: the same, coarse and extended into
 // the neighborhood. zOld: the distance that the content had there.
-// lean: how much more the cumulus lean now than in that image (tangent). If the
-// wind has changed since, what is high up in a cloud stood closer to its base
-// then, or farther from it.
-float3 driftOf(float3 d, float z, float back, float lean) {
+// back: how far the wind has shifted the cloud field since that image (uBack).
+// lean: how much more the cumulus lean now than in that image, sideways per
+// meter of height. If the wind has changed since, what is high up in a cloud
+// stood closer to its base then, or farther from it.
+float3 driftOf(float3 d, float z, float4 back, float2 lean) {
   float3 at = float3(0.0, R_PLANET + EYE_ALT - uCloudLift, 0.0) + d * (z * 1000.0);
   float h = length(at) - R_PLANET - EYE_ALT;
-  float3 was = back * CL_TILE * windAt(h);
-  if (h < 4500.0) was.xz -= DOWNWIND * (lean * max(h - CUMULUS_LO, 0.0));
-  return was;
+  float2 was = h > 4500.0 ? back.zw : back.xy;
+  if (h < 4500.0) was -= lean * max(h - CUMULUS_LO, 0.0);
+  return float3(was.x, 0.0, was.y);
 }
 
 // The distance z of what is now in view direction d, found by fixed point: the
 // cloud at the place it came from, with that distance, until it no longer
 // changes. Returns whether there was a cloud at about the starting distance at
 // each step.
-bool settle(Texture2D zTex, float3 d, float back, float lean, inout float z) {
+bool settle(Texture2D zTex, float3 d, float4 back, float2 lean, inout float z) {
   bool same = true;
   [unroll] for (int k = 0; k < 3; k++) {
     float3 Q = d * (z * 1000.0) + driftOf(d, z, back, lean);
@@ -372,9 +376,9 @@ bool settle(Texture2D zTex, float3 d, float back, float lean, inout float z) {
 // still here (open sky), or it was a cloud that has moved on, and then it is
 // looked up with its own distance. If that cloud was not where it came from,
 // there is no valid history: returns a position outside the image.
-float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float back, float lean, bool empty, out float zOld) {
+float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float4 back, float2 lean, bool empty, out float zOld) {
   zOld = z;
-  if ((abs(back) < 1e-7 && abs(lean) < 1e-6) || d.y <= 0.004) return uv;
+  if ((dot(back, back) < 1e-6 && dot(lean, lean) < 1e-12) || d.y <= 0.004) return uv;
   if (z <= 0.0 && empty) {
     z = depthAt(zTex, uv);
     if (z <= 0.0) return uv;
@@ -515,14 +519,14 @@ float4 cloudSharp(float2 uv) {
 
 struct AirOut {
   float4 col : SV_Target0;   // light of the clouds, transmittance
-  float4 z : SV_Target1;     // r: their mean distance in km; g, b: spread and distance, averaged over the passes
+  float4 z : SV_Target1;     // r: their mean distance in km; g, b: spread and distance, averaged over the passes; a: how much cirrus is seen (for the halo)
 };
 
 // Clouds. uSub offsets the sampling by fractions of a pixel per pass; averaged
 // over the passes this smooths the edges. Averaging uses the previous image, at
 // the position where this cloud was in it.
 AirOut Air(float4 pos : SV_Position) {
-  cloudShift = uCloudT;
+  cloudDrift = uDrift;
   cloudAge = uEvolve;
   lightJit = ign(pos.yx + 1.7 * uJit + 11.0);
   float2 uv = pos.xy / uRes;
@@ -531,13 +535,20 @@ AirOut Air(float4 pos : SV_Position) {
   float3 s = lightDir(d);
 
   float4 now = float4(0.0, 0.0, 0.0, 1.0);
-  float zNow = 0.0, deepNow = 0.0;
-  if (uClouds > 0.001 && d.y > 0.004) {
+  float zNow = 0.0, deepNow = 0.0, seenNow = 0.0;
+  if ((uClouds > 0.001 || uCirrus > 0.001) && d.y > 0.004) {
     float3 sky = tBase.SampleLevel(sClamp, p / uView, 0.0).rgb / uExposure;
-    float distLow, distHigh;
-    float4 low = cloudLayer(d, s, sky, ign(pos.xy + uJit), distLow);
-    float lowDeep = cloudDeep;
-    float4 high = highLayer(d, s, ign(pos.yx + 2.3 * uJit + 5.0), distHigh);
+    float distLow = 0.0, distHigh = 0.0, lowDeep = 0.0;
+    float4 low = float4(0.0, 0.0, 0.0, 1.0), high = float4(0.0, 0.0, 0.0, 1.0);
+    if (uClouds > 0.001) {
+      low = cloudLayer(d, s, sky, ign(pos.xy + uJit), distLow);
+      lowDeep = cloudDeep;
+    }
+    if (uCirrus > 0.001) {
+      high = highLayer(d, s, ign(pos.yx + 2.3 * uJit + 5.0), distHigh);
+      // Cumulus in front hides it, and in the distance the haze.
+      seenNow = cirrusSeen * low.a * exp(-distHigh / 140e3);
+    }
     // Distant clouds fade into the haze of the air: they take on the color of the
     // sky in front of which they stand.
     low.rgb = lerp(sky * (1.0 - low.a), low.rgb, exp(-distLow / 45e3));
@@ -554,15 +565,17 @@ AirOut Air(float4 pos : SV_Position) {
   float4 was = now;
   float zWas = zNow;
   float2 soft = float2(zNow, deepNow);
+  float seenWas = seenNow;
   if (share < 0.999) {
     float zOld;
     // The history is looked up for the center of the pixel, not for the offset
     // sample of this pass: otherwise it would be read shifted by a fraction on every
     // pass and would blur over time.
-    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, uSea.w, zNow <= 0.0, zOld);
+    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, uLean.zw, zNow <= 0.0, zOld);
     if (uvOld.x > 0.0 && uvOld.y > 0.0 && uvOld.x < 1.0 && uvOld.y < 1.0) {
       was = cloudSharp(uvOld);
       zWas = depthAt(tCloudZ, uvOld);
+      seenWas = tCloudZ.SampleLevel(sClamp, uvOld, 0.0).a;
       // If a different cloud was there than the one that is here now (a nearer one had
       // covered it), the new one counts more. At the edge of a cloud one pass hits it
       // and the next does not; that is meant to average out and gives the smooth
@@ -577,7 +590,8 @@ AirOut Air(float4 pos : SV_Position) {
   AirOut o;
   o.col = lerp(was, now, share);
   float z = zNow > 0.0 ? zNow : (o.col.a < 0.998 ? zWas : 0.0);
-  o.z = z > 0.0 ? float4(z, soft.y, soft.x > 0.0 ? soft.x : z, 1.0) : float4(0.0, 0.0, 0.0, 1.0);
+  float seen = lerp(seenWas, seenNow, share);
+  o.z = z > 0.0 ? float4(z, soft.y, soft.x > 0.0 ? soft.x : z, seen) : float4(0.0, 0.0, 0.0, seen);
   return o;
 }
 
@@ -585,7 +599,7 @@ AirOut Air(float4 pos : SV_Position) {
 // distance it falls on average and how far it spreads around that. Averaged with
 // the previous image (bound as tRain), which smooths the samples.
 float4 Rain(float4 pos : SV_Position) : SV_Target {
-  cloudShift = uCloudT;
+  cloudDrift = uDrift;
   cloudAge = uEvolve;
   float2 uv = pos.xy / uRes;
   float dist, deep;
@@ -714,7 +728,7 @@ float rainFlash(float3 v, float3 rain) {
 // fall. Gusts make the slant vary, slightly differently in each layer.
 float rainFall(float2 p) {
   float sum = 0.0;
-  float lean = -SURF.x * uWind.x;
+  float lean = -uSurf.x * uWind.x;
   float turn = uStorm.w * (6.2831853 / 64.0);
   for (int k = 0; k < 5; k++) {
     float far = float(k) * 0.25;
@@ -747,7 +761,7 @@ float rainFall(float2 p) {
 // more than rain, and each flake sways on its way.
 float snowFall(float2 p) {
   float sum = 0.0;
-  float lean = -SURF.x * uSnow.w;
+  float lean = -uSurf.x * uSnow.w;
   float turn = uStorm.w * (6.2831853 / 64.0);
   for (int k = 0; k < 6; k++) {
     float far = float(k) * 0.2;
@@ -781,20 +795,22 @@ float snowFall(float2 p) {
 // smoothly by every finished image: the search in cloudFrom is too costly for
 // every pixel of each of them.
 float4 Flow(float4 pos : SV_Position) : SV_Target {
-  cloudShift = uCloudT;
+  cloudDrift = uDrift;
   float2 au = pos.xy / uRes;
   float3 toward = dirOf(airPoint(au));
   float zThere;
-  float2 a = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, 0.0, false, zThere);
-  float2 b = uFade < 0.999 ? cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, uSea.w, false, zThere) : au;
+  float2 a = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, float2(0.0, 0.0), false, zThere);
+  float2 b = uFade < 0.999 ? cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, uLean.zw, false, zThere) : au;
   return float4(a.x < 0.0 ? float2(-9.0, -9.0) : a - au, b.x < 0.0 ? float2(-9.0, -9.0) : b - au);
 }
 
-void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
+// seen: how much cirrus is seen there (for the halo).
+void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ, out float seen) {
   float2 au = airUv(p);
   float4 flow = tFlow.SampleLevel(sClamp, au, 0.0);
   float2 from = flow.x < -1.0 ? float2(-1.0, -1.0) : au + flow.xy;
   cloud = tCloud.SampleLevel(sClamp, from, 0.0);
+  seen = tCloudZ.SampleLevel(sClamp, from, 0.0).a;
   // Distance of the clouds at this position in km, 0 = none: by this they lie in
   // front of or behind the land.
   cloudZ = depthSoft(tCloudZ, from);
@@ -806,6 +822,7 @@ void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
     // (see Flow).
     from = flow.z < -1.0 ? float2(-1.0, -1.0) : au + flow.zw;
     float4 older = tCloudOld.SampleLevel(sClamp, from, 0.0);
+    seen = lerp(tCloudZOld.SampleLevel(sClamp, from, 0.0).a, seen, uFade);
     float2 zOlder = depthSoft(tCloudZOld, from);
     if (zOlder.x <= 0.0) zOlder = float2(tNearOld.SampleLevel(sClamp, from, 0.0).r, 0.0);
     cloud = lerp(older, cloud, uFade);
@@ -822,7 +839,10 @@ float4 Face(float4 pos : SV_Position) : SV_Target {
   float3 toward = dirOf(p);
   float4 cloud;
   float2 cloudZ;
-  cloudsAt(p, toward, cloud, cloudZ);
+  float seen;
+  cloudsAt(p, toward, cloud, cloudZ, seen);
+  // The halo in the cirrus, where it can be seen.
+  if (seen > 1e-5) cloud.rgb += uCirrusCol * (SUN_E * CL_GAIN * smoothstep(0.25, 0.6, uCirrus) * seen * uExposure) * iceHalo(toward);
   // Sheet lightning: lightning lights the clouds around it from inside. What lies
   // close to it glows; clouds in front, farther away from it, stay dark and appear
   // as an outline against the glow.
@@ -933,10 +953,14 @@ cbuffer PropC : register(b3) {
   float4 uPropLight;    // x, y: position in the image at which the shadow of the clouds on the water is read; z: 1 = read it there, 0 = as at the viewer, 2 = above the clouds; w: how much light comes back from below
   float4 uPropWing;     // birds: x: angle of the inner wing, y: additional angle of the outer wing, z: half width of the body, w: length of a wing (0 = rigid)
   float4 uPropAxis;     // x: height of the wing root in the model, y: 1 = mirrored left to right
+  float4 uPropShade;    // x: radius of its shadow map around its origin, meters (0: none); y: height of the bow wave at the stem, meters (0: none); z: where the stem is, forward in the model; w: length over which the bow wave falls off
 };
 
 Texture2DArray tPropTex : register(t25);          // surface colors of the model, one layer per material
 Texture2DMS<float4> tPropWork : register(t26);    // the work image: light of the covered samples, a = covered
+Texture2D tPropShadow : register(t30);            // its shadow map: depth along the light
+SamplerComparisonState sShadow : register(s3);
+static const float SHADOW_SIZE = 1024.0;          // as in render.cpp
 
 struct PropVert {
   float3 pos : POSITION;      // meters: right, up, forward
@@ -953,10 +977,13 @@ struct PropOut {
   float3 at : TEXCOORD1;      // position relative to the eye
   float height : TEXCOORD2;   // above the water
   float thin : TEXCOORD3;     // 1: sailcloth or feathers, light shines through
+  float3 local : TEXCOORD4;   // position in the model, as posed
 };
 
-PropOut PropVS(PropVert v) {
-  float3 m = v.pos, n = v.normal.xyz;
+// The vertex as posed: wing beat and mirroring. m: position in the model, n: its
+// normal.
+void propPose(PropVert v, out float3 m, out float3 n) {
+  m = v.pos, n = v.normal.xyz;
   if (uPropWing.w > 0.0) {
     // The wing beat: the inner wing turns at the shoulder, the outer part bends
     // further at the wrist. Each point turns around the shoulder by the angle that
@@ -978,9 +1005,62 @@ PropOut PropVS(PropVert v) {
     m.x = -m.x;
     n.x = -n.x;
   }
+}
+
+// Turned as the model lies: right, up, ahead, relative to its origin.
+float3 propTurn(float3 m) {
+  return float3(dot(uPropRow[0].xyz, m), dot(uPropRow[1].xyz, m), dot(uPropRow[2].xyz, m));
+}
+
+// Direction to the light source for the model. What floats is lit like the land
+// beside it; what flies like the clouds around it: backlit in front of the light
+// source, from the side far from it.
+float3 propLight() {
+  if (uPropLight.z > 0.5 && uPropLight.z < 1.5) return groundLight();
+  return lightDir(normalize(float3(uPropRow[0].w, uPropRow[1].w + uPropDepth.z, uPropRow[2].w)));
+}
+
+// Position in the shadow map: across the light (xy, -1 to 1) and along it
+// (z, 0 nearest the light source to 1).
+float3 shadeAt(float3 rel, float3 l) {
+  float3 up = abs(l.y) < 0.95 ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
+  float3 u = normalize(cross(up, l)), w = cross(l, u);
+  float r = uPropShade.x;
+  return float3(dot(rel, u) / r, dot(rel, w) / r, 0.5 - 0.5 * dot(rel, l) / r);
+}
+
+// The model seen from the light source, depth only: its shadow map.
+float4 PropShadowVS(PropVert v) : SV_Position {
+  float3 m, n;
+  propPose(v, m, n);
+  float3 s = shadeAt(propTurn(m), propLight());
+  return float4(s.xy, s.z, 1.0);
+}
+
+// How much of the light reaches this position past the model itself: the sails
+// shade the deck, the superstructure the containers, the wing the body. n: the
+// normal; the lookup is moved slightly toward the light along it, or the surface
+// would shade itself.
+float propSelf(float3 m, float3 n, float3 l) {
+  if (uPropShade.x <= 0.0) return 1.0;
+  float texel = 2.0 * uPropShade.x / SHADOW_SIZE;
+  float3 toward = dot(n, l) >= 0.0 ? n : -n;
+  float3 s = shadeAt(propTurn(m) + toward * (1.5 * texel) + l * texel, l);
+  float2 uv = float2(0.5 + 0.5 * s.x, 0.5 - 0.5 * s.y);
+  float sum = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) sum += tPropShadow.SampleCmpLevelZero(sShadow, uv + float2(i, j) / SHADOW_SIZE, s.z);
+  }
+  return sum / 9.0;
+}
+
+PropOut PropVS(PropVert v) {
+  float3 m, n;
+  propPose(v, m, n);
   PropOut o;
-  float3 at = float3(dot(uPropRow[0].xyz, m), dot(uPropRow[1].xyz, m), dot(uPropRow[2].xyz, m)) + float3(uPropRow[0].w, uPropRow[1].w, uPropRow[2].w);
-  o.normal = float3(dot(uPropRow[0].xyz, n), dot(uPropRow[1].xyz, n), dot(uPropRow[2].xyz, n));
+  o.local = m;
+  float3 at = propTurn(m) + float3(uPropRow[0].w, uPropRow[1].w, uPropRow[2].w);
+  o.normal = propTurn(n);
   o.height = at.y;
   // As seen from the eye: the water lies below it, and with distance the Earth
   // curves away downward.
@@ -1015,18 +1095,26 @@ PropLit PropIn(PropOut v) {
   float3 n = normalize(v.normal);
   // Thin parts such as sails are seen from both sides.
   if (dot(n, view) < 0.0) n = -n;
-  // What floats is lit like the land beside it. What flies is lit like the clouds
-  // around it: backlit in front of the light source, from the side far from it.
-  float3 l = groundLight();
+  float3 l = propLight();
   float open = sunThrough();
   if (uPropLight.z > 0.5 && uPropLight.z < 1.5) {
     open = lerp(open, tShade.SampleLevel(sClamp, uPropLight.xy, 0.0).r, smoothstep(0.05, 0.16, l.y));
-  } else {
-    l = lightDir(normalize(float3(uPropRow[0].w, uPropRow[1].w + uPropDepth.z, uPropRow[2].w)));
-    if (uPropLight.z > 1.5) open = 1.0;
+  } else if (uPropLight.z > 1.5) {
+    open = 1.0;
   }
   // Fog above it takes the direct light.
   open *= fogSun(uPropAir.y);
+  float self = propSelf(v.local, n, l);
+  // The bow wave: white water heaped up at the stem, falling off aft, its top
+  // edge uneven.
+  float3 albedo = tex.rgb * v.tint;
+  float wash = 0.0;
+  if (uPropShade.y > 0.0) {
+    float aft = uPropShade.z - v.local.z;
+    float high = uPropShade.y * exp(-max(aft, 0.0) / uPropShade.w) * (0.8 + 0.2 * sin(0.9 * v.local.z) * sin(0.37 * v.local.z + 1.3));
+    wash = smoothstep(high, 0.6 * high, v.height) * step(-0.5, aft);
+    albedo = lerp(albedo, float3(0.78, 0.8, 0.82), wash);
+  }
   float facing = saturate(dot(n, l));
   // Through sailcloth and feathers part of the light shines when it comes from
   // behind.
@@ -1040,11 +1128,11 @@ PropLit PropIn(PropOut v) {
   // the ground: white wings stay white.
   float aloft = uPropLight.z > 0.5 && uPropLight.z < 1.5 ? 0.0 : 1.0;
   float3 direct = lerp(uSunLand, luma(uSunLand) * float3(1.03, 1.0, 0.95), 0.55 * aloft);
-  float3 light = direct * (facing * open) + uSkyLand * lerp(lerp(0.10, 0.16, aloft), lerp(0.42, 0.48, aloft), up) +
+  float3 light = direct * (facing * open * self) + uSkyLand * lerp(lerp(0.10, 0.16, aloft), lerp(0.42, 0.48, aloft), up) +
                  (uSunLand * (saturate(l.y) * open) + uSkyLand * 0.5) * ((1.0 - up) * uPropLight.w);
-  float3 lit = tex.rgb * v.tint * light;
+  float3 lit = albedo * light;
   // Paint and glass show the light source as a highlight.
-  if (uPropAir.w > 0.0 && facing > 0.0) lit += uSunLand * (open * uPropAir.w * pow(saturate(dot(n, normalize(l + view))), 64.0));
+  if (uPropAir.w > 0.0 && facing > 0.0) lit += uSunLand * (open * self * (1.0 - wash) * uPropAir.w * pow(saturate(dot(n, normalize(l + view))), 64.0));
   o.col = float4(lit, 1.0);
   return o;
 }
@@ -1079,7 +1167,8 @@ void propBetween(float2 p, float2 uv, float dist, out float3 through, out float 
   seen = uFog.x > 0.0 ? exp(-fogAlong(dirOf(p), dist, uPropAir.y)) : 1.0;
   float4 cloud;
   float2 cloudZ;
-  cloudsAt(p, dirOf(p), cloud, cloudZ);
+  float cirrus;
+  cloudsAt(p, dirOf(p), cloud, cloudZ, cirrus);
   float tBack;
   float3 lightBack;
   cloudSplit(cloud, cloudZ, dist, front, glow, tBack, lightBack);
@@ -1147,7 +1236,7 @@ float4 Lamp(float4 pos : SV_Position) : SV_Target {
 // transmittance in the immediate surroundings of the sun (r) and exactly toward
 // its center (g).
 float4 Pick(float4 pos : SV_Position) : SV_Target {
-  cloudShift = pos.x / uCount * uSpan;
+  cloudDrift = (pos.x / uCount * uSpan) * uWindVec;
   cloudAge = 0.0;
   lightJit = 0.5;
   float3 s = uSunDir;
@@ -1168,7 +1257,7 @@ float4 Pick(float4 pos : SV_Position) : SV_Target {
 // four samples per pixel spread over its height, otherwise it would flicker
 // there.
 float4 Shade(float4 pos : SV_Position) : SV_Target {
-  cloudShift = uCloudT;
+  cloudDrift = uDrift;
   cloudAge = uEvolve;
   float3 l = groundLight();
   if (pos.y / uRes.y * uView.y < uHorizon - 4.0 || l.y <= 0.04) return 1.0;

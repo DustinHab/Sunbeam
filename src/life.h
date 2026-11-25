@@ -20,6 +20,7 @@ struct Prop {
   float wing = 0;          // birds: angle of the inner wing against its rest position, upward
   float tip = 0;           // and of the outer wing against the inner one
   bool mirrored = false;   // the model reversed left to right
+  float speed = 0;         // over the ground, meters per second: ships and boats draw their wake by it
 };
 
 // What it depends on.

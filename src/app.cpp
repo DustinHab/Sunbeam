@@ -79,6 +79,7 @@ const Setting SETTINGS[] = {
     {L"Moonlight", &Params::moonlight},   {L"HdrGlow", &Params::glow},
     {L"MoonSize", &Params::moonRadius}, {L"Rays", &Params::rays}, {L"Ground", &Params::ground},
     {L"Life", &Params::life},           {L"ShootingStars", &Params::meteors},
+    {L"WindDirection", &Params::windDir}, {L"Cirrus", &Params::cirrus},
 };
 
 struct App {
@@ -98,14 +99,14 @@ struct App {
   // set by hand is kept and stays in the file.
   bool realWeather = false;         // the switch
   bool weatherOn = false;           // and whether it already applies
-  float manualClouds = 0.5f, manualWind = 0.5f;
+  float manualClouds = 0.5f, manualWind = 0.5f, manualWindDir = 253.3f, manualCirrus = 0.3f;
   WeatherFeed feed;
   // The place: its name if it was found by name, and a search under way.
   std::wstring place;
   PlaceSearch search;
   std::wstring placeState;          // shown below the field while searching or after a failed search
   bool goalSet = false;             // a report has already arrived
-  float goalClouds = 0, goalWind = 0;   // the sliders glide to these values
+  float goalClouds = 0, goalWind = 0, goalWindDir = 0, goalCirrus = 0;   // the sliders glide to these values
   WeatherNow report;                // the latest report
   float manualFog = 0;              // the slider Fog as set by hand
   float manualTemperature = SEASON; // the slider Temperature as set by hand; SEASON: it follows the season
@@ -133,6 +134,7 @@ struct App {
   HWINEVENTHOOK hook = nullptr;
   NOTIFYICONDATAW tray{};
   UINT taskbarCreated = 0;
+  UINT openAsked = 0;        // a second start asks the running Sunbeam to show its settings
 
   // The icon mask is drawn by a separate thread: fetching the images from the
   // shell takes time, and the desktop must not stall meanwhile.
@@ -274,6 +276,7 @@ void loadSettings() {
   p.moonRadius = p.moonRadius <= 0 ? 0 : std::clamp(p.moonRadius, 8.0f, 90.0f);
   p.rays = std::clamp(p.rays, 0.0f, 1.0f);
   p.clouds = std::clamp(p.clouds, 0.0f, 2.0f);
+  p.cirrus = std::clamp(p.cirrus, 0.0f, 1.0f);
   p.wind = std::clamp(p.wind, 0.0f, 1.0f);
   p.exposure = std::clamp(p.exposure, 0.1f, 4.0f);
   p.bloom = std::clamp(p.bloom, 0.0f, 2.0f);
@@ -290,12 +293,15 @@ void loadSettings() {
   p.glow = std::clamp(p.glow, 1.0f, 6.0f);
   p.life = std::clamp(p.life, 0.0f, 1.0f);
   p.meteors = std::clamp(p.meteors, 0.0f, 2.0f);
+  p.windDir = std::fmod(std::fmod(p.windDir, 360.0f) + 360.0f, 360.0f);
   app->par = p;
   // With live weather, what is in the file counts as set by hand; the sliders stay
   // where the weather has put them.
   app->realWeather = readNumber(L"RealWeather", 0) > 0.5f;
-  app->manualClouds = p.clouds, app->manualWind = p.wind;
-  if (app->realWeather && app->weatherOn && app->goalSet) app->par.clouds = before.clouds, app->par.wind = before.wind;
+  app->manualClouds = p.clouds, app->manualWind = p.wind, app->manualWindDir = p.windDir, app->manualCirrus = p.cirrus;
+  if (app->realWeather && app->weatherOn && app->goalSet) {
+    app->par.clouds = before.clouds, app->par.wind = before.wind, app->par.windDir = before.windDir, app->par.cirrus = before.cirrus;
+  }
   app->manualFog = std::clamp(readNumber(L"Fog", 0), 0.0f, 1.0f);
   app->manualTemperature = readNumber(L"Temperature", SEASON);
   if (app->manualTemperature > -50) app->manualTemperature = std::clamp(app->manualTemperature, -20.0f, 35.0f);
@@ -308,6 +314,9 @@ void loadSettings() {
   app->course = std::clamp(int(readNumber(L"Course", float(app->course))), 0, 2);
   app->latitude = std::clamp(double(readNumber(L"Latitude", float(app->latitude))), -89.0, 89.0);
   app->longitude = std::clamp(double(readNumber(L"Longitude", float(app->longitude))), -180.0, 180.0);
+  // The image looks south in the northern hemisphere and north in the southern:
+  // that is where the sun is at noon. The direction of the wind refers to it.
+  app->par.facing = app->latitude >= 0 ? 180.0f : 0.0f;
   app->lapseMinutes = std::clamp(readNumber(L"TimeLapse", app->lapseMinutes), 0.5f, 240.0f);
   wchar_t name[160];
   GetPrivateProfileStringW(L"Sunbeam", L"Place", L"", name, 160, app->ini.c_str());
@@ -331,6 +340,8 @@ void saveSettings() {
   if (app->weatherOn) {
     writeNumber(L"Clouds", app->manualClouds);
     writeNumber(L"Wind", app->manualWind);
+    writeNumber(L"WindDirection", app->manualWindDir);
+    writeNumber(L"Cirrus", app->manualCirrus);
   }
   writeNumber(L"Fog", app->manualFog);
   writeNumber(L"Temperature", app->manualTemperature);
@@ -343,6 +354,8 @@ void setPlace(const Place& p) {
   app->longitude = std::clamp(p.longitude, -180.0, 180.0);
   app->place = p.name;
   app->placeState.clear();
+  app->par.facing = app->latitude >= 0 ? 180.0f : 0.0f;
+  app->render.setParams(app->par);
   saveSettings();
   app->sceneEvent = true;
   logf(L"Place changed");
@@ -380,12 +393,14 @@ void syncWeather() {
   app->weatherOn = app->realWeather;
   app->goalSet = false;
   if (app->weatherOn) {
-    app->manualClouds = app->par.clouds, app->manualWind = app->par.wind;
+    app->manualClouds = app->par.clouds, app->manualWind = app->par.wind, app->manualWindDir = app->par.windDir;
+    app->manualCirrus = app->par.cirrus;
     app->feed.start(app->latitude, app->longitude);
     logf(L"Live weather on");
   } else {
     app->feed.stop();
-    app->par.clouds = app->manualClouds, app->par.wind = app->manualWind;
+    app->par.clouds = app->manualClouds, app->par.wind = app->manualWind, app->par.windDir = app->manualWindDir;
+    app->par.cirrus = app->manualCirrus;
     logf(L"Live weather off");
   }
 }
@@ -399,17 +414,19 @@ void tickWeather() {
   app->feed.start(app->latitude, app->longitude);
   WeatherNow w;
   if (app->feed.take(w)) {
-    weatherSliders(w, app->goalClouds, app->goalWind);
+    weatherSliders(w, app->goalClouds, app->goalWind, app->goalCirrus);
+    app->goalWindDir = w.windDir;
     bool first = !app->goalSet;
     app->goalSet = true;
     app->report = w;
-    logf(L"Weather: cloud cover %.0f %%, precipitation %.1f mm/h, wind %.1f m/s, gusts %.1f m/s, code %d, %.1f degrees (day %.1f), visibility %.0f m, "
-         L"snow %.2f m; clouds %.2f, wind %.2f, fog %.2f",
-         w.cover * 100, w.rain, w.wind, w.gust, w.code, w.temperature, w.dayTemperature, w.visibility, w.snowDepth, app->goalClouds, app->goalWind,
-         weatherFog(w));
+    logf(L"Weather: cloud cover %.0f %% (high %.0f %%), precipitation %.1f mm/h, wind %.1f m/s from %.0f degrees, gusts %.1f m/s, code %d, %.1f degrees "
+         L"(day %.1f), visibility %.0f m, snow %.2f m; clouds %.2f, cirrus %.2f, wind %.2f, fog %.2f",
+         w.cover * 100, w.high * 100, w.rain, w.wind, w.windDir, w.gust, w.code, w.temperature, w.dayTemperature, w.visibility, w.snowDepth,
+         app->goalClouds, app->goalCirrus, app->goalWind, weatherFog(w));
     // As long as the sky is not visible at all yet, it applies immediately.
     if (first && !app->skyUp) {
-      app->par.clouds = app->goalClouds, app->par.wind = app->goalWind;
+      app->par.clouds = app->goalClouds, app->par.wind = app->goalWind, app->par.windDir = app->goalWindDir;
+      app->par.cirrus = app->goalCirrus;
       applyClimate(true);
       app->render.setParams(app->par);
       return;
@@ -418,9 +435,14 @@ void tickWeather() {
   if (!app->goalSet) return;
   float clouds = app->par.clouds + std::clamp(app->goalClouds - app->par.clouds, -0.03f, 0.03f);
   float wind = app->par.wind + std::clamp(app->goalWind - app->par.wind, -0.02f, 0.02f);
-  if (clouds == app->par.clouds && wind == app->par.wind) return;
-  app->par.clouds = clouds, app->par.wind = wind;
-  app->render.drift(clouds, wind);
+  float cirrus = app->par.cirrus + std::clamp(app->goalCirrus - app->par.cirrus, -0.03f, 0.03f);
+  // The direction the short way round, at most three degrees a second.
+  float turn = std::fmod(app->goalWindDir - app->par.windDir + 540.0f, 360.0f) - 180.0f;
+  float dir = std::fmod(app->par.windDir + std::clamp(turn, -3.0f, 3.0f) + 360.0f, 360.0f);
+  if (std::abs(turn) < 0.01f) dir = app->par.windDir;
+  if (clouds == app->par.clouds && wind == app->par.wind && dir == app->par.windDir && cirrus == app->par.cirrus) return;
+  app->par.clouds = clouds, app->par.wind = wind, app->par.windDir = dir, app->par.cirrus = cirrus;
+  app->render.glide(clouds, cirrus, wind, dir);
 }
 
 // Fog, temperature and snow for the image. With live weather they come from the
@@ -824,6 +846,10 @@ void trayMenu() {
 LRESULT CALLBACK hostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   if (app && msg == app->taskbarCreated && msg != 0) {
     app->rebuild = true;   // Explorer has restarted: attach icon and sky again
+    return 0;
+  }
+  if (app && msg == app->openAsked && msg != 0) {
+    openSettings();
     return 0;
   }
   switch (msg) {
@@ -1926,8 +1952,9 @@ void run() {
       std::vector<uint8_t> map;
       int mw = 0, mh = 0;
       if (app->render.dumpDepth(map, mw, mh)) writeImage(app->dir + L"\\spot_depth.png", map.data(), mw, mh, 1);
-      logf(L"Spot captured at %d %d (device pixels), depth map %d x %d, course %d, cloud shift %.4f", cx, cy, mw, mh, app->course,
-           app->render.cloudShift());
+      Renderer::Drift drift = app->render.cloudDrift();
+      logf(L"Spot captured at %d %d (device pixels), depth map %d x %d, course %d, cloud shift %.1f %.1f m", cx, cy, mw, mh, app->course,
+           drift.low[0], drift.low[1]);
     }
     if (app->probe > 0) {
       double sent = now();
@@ -1951,12 +1978,24 @@ void run() {
 }  // namespace
 
 int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir, bool blind) {
-  // Only one running Sunbeam. A probe run does not hold this lock, so that it
-  // never blocks the actual start.
+  // Only one running Sunbeam. Started again (from the Start menu, say), it shows
+  // the settings of the one that runs. A probe run does not hold this lock, so
+  // that it never blocks the actual start.
   HANDLE once = nullptr;
+  UINT openAsked = RegisterWindowMessageW(L"Sunbeam-OpenSettings");
   if (probeSeconds <= 0) {
     once = CreateMutexW(nullptr, TRUE, L"Sunbeam-Desktop");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+      if (HWND running = FindWindowW(HOST_CLASS, nullptr)) {
+        // The settings window may come to the front.
+        DWORD pid = 0;
+        GetWindowThreadProcessId(running, &pid);
+        AllowSetForegroundWindow(pid);
+        PostMessageW(running, openAsked, 0, 0);
+      }
+      if (once) CloseHandle(once);
+      return 0;
+    }
   }
 
   App state;
@@ -2005,7 +2044,14 @@ int runApp(HINSTANCE instance, double probeSeconds, const std::wstring& probeDir
 
   registerClasses();
   app->taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+  app->openAsked = openAsked;
   app->host = CreateWindowExW(WS_EX_TOOLWINDOW, HOST_CLASS, L"Sunbeam", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+  // Messages from other processes, among them a second start, reach the window
+  // even when this one runs elevated.
+  ChangeWindowMessageFilterEx(app->host, openAsked, MSGFLT_ALLOW, nullptr);
+  // On the very first start the settings show, so that one sees Sunbeam is there
+  // and can enter the place.
+  if (fresh && probeSeconds <= 0) PostMessageW(app->host, openAsked, 0, 0);
   // Emergency exit: Ctrl+Alt+Shift+Q quits the program from anywhere.
   if (probeSeconds <= 0) RegisterHotKey(app->host, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'Q');
   // Ctrl+Alt+Shift+B captures what is on the screen under the mouse pointer (for

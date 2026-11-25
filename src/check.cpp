@@ -259,7 +259,7 @@ bool readValues(const std::wstring& dir, FILE* log, Params& p, double& shift) {
               {"Stars", &Params::stars},        {"Moonlight", &Params::moonlight},   {"HdrGlow", &Params::glow},
               {"SunSize", &Params::sunRadius}, {"MoonSize", &Params::moonRadius}, {"Rays", &Params::rays}, {"Ground", &Params::ground},
               {"Life", &Params::life},         {"Fog", &Params::fog},          {"Temperature", &Params::temperature},
-              {"ShootingStars", &Params::meteors},
+              {"ShootingStars", &Params::meteors}, {"WindDirection", &Params::windDir}, {"Cirrus", &Params::cirrus},
               {"DayTemperature", &Params::dayTemperature}, {"SnowDepth", &Params::snowDepth}, {"Pointer", &Params::pointer},
               {"Resolution", &Params::resolution}};
   char key[64];
@@ -1504,22 +1504,32 @@ int runSky(const std::wstring& dir, int viewW, int viewH, float scale) {
     // once per second as with live weather, without the sky starting over.
     {
       FILE* glide = nullptr;
-      float toClouds = 0, toWind = 0;
+      float toClouds = 0, toWind = 0, toDir = -1;
       if (!_wfopen_s(&glide, (dir + L"\\glide.txt").c_str(), L"r") && glide) {
-        if (fscanf_s(glide, "%f %f", &toClouds, &toWind) == 2) {
-          float clouds = r.params().clouds, wind = r.params().wind;
+        // A third number: the direction the wind turns to, as with live weather three
+        // degrees a second; a fourth: the slider Cirrus.
+        float toCirrus = -1;
+        int read = fscanf_s(glide, "%f %f %f %f", &toClouds, &toWind, &toDir, &toCirrus);
+        if (read >= 2) {
+          float clouds = r.params().clouds, wind = r.params().wind, from = r.params().windDir, cirrus = r.params().cirrus;
+          if (read < 3) toDir = from;
+          if (read < 4) toCirrus = cirrus;
           int unsettled = 0;
-          for (int i = 0; i < 6000 && (clouds != toClouds || wind != toWind); i++) {
+          for (int i = 0; i < 6000 && (clouds != toClouds || wind != toWind || from != toDir || cirrus != toCirrus); i++) {
             if (i % 60 == 0) {
               clouds = std::abs(toClouds - clouds) < 0.03f ? toClouds : clouds + (toClouds > clouds ? 0.03f : -0.03f);
+              cirrus = std::abs(toCirrus - cirrus) < 0.03f ? toCirrus : cirrus + (toCirrus > cirrus ? 0.03f : -0.03f);
               wind = std::abs(toWind - wind) < 0.02f ? toWind : wind + (toWind > wind ? 0.02f : -0.02f);
-              r.drift(clouds, wind);
+              float turn = std::fmod(toDir - from + 540.0f, 360.0f) - 180.0f;
+              from = std::abs(turn) <= 3.0f ? toDir : std::fmod(from + (turn > 0 ? 3.0f : -3.0f) + 360.0f, 360.0f);
+              r.glide(clouds, cirrus, wind, from);
             }
             r.render(1.0 / 60, skyOut.rtv.Get(), lightOut.rtv.Get());
             unsettled += !r.skySettled();
           }
           for (int i = 0; i < 240; i++) r.render(1.0 / 60, skyOut.rtv.Get(), lightOut.rtv.Get());
-          fprintf(log, "             glided to clouds %.2f, wind %.2f; frames without a finished sky on the way: %d\n", clouds, wind, unsettled);
+          fprintf(log, "             glided to clouds %.2f, wind %.2f from %.0f degrees; frames without a finished sky on the way: %d\n", clouds, wind, from,
+                  unsettled);
         }
         fclose(glide);
       }
@@ -1764,7 +1774,7 @@ int runDrift(const std::wstring& dir, int viewW, int viewH, float scale) {
     for (int i = 0; i < 7; i++) moving.render(dt, skyOut.rtv.Get(), lightOut.rtv.Get());
     moving.sync();
     Image shown = readBack(ctx.Get(), skyOut, pw, ph);
-    still.seek(moving.cloudShift(), moving.cloudAge());
+    still.seek(moving.cloudDrift(), moving.cloudAge());
     for (int i = 0; i < 240; i++) still.render(0, skyRef.rtv.Get(), nullptr);
     still.sync();
     Image right = readBack(ctx.Get(), skyRef, pw, ph);
@@ -1898,18 +1908,29 @@ int runWeatherCheck(const std::wstring& dir, const std::wstring& query) {
   for (const auto& c : cases) {
     WeatherNow w;
     w.valid = true, w.cover = c.cover, w.rain = c.rain, w.wind = c.wind, w.gust = c.gust, w.code = c.code;
-    float clouds = 0, wind = 0;
-    weatherSliders(w, clouds, wind);
+    float clouds = 0, wind = 0, cirrus = 0;
+    weatherSliders(w, clouds, wind, cirrus);
     fprintf(log, "  %-24s clouds %.2f  wind %.2f\n", c.name, clouds, wind);
+  }
+  {
+    // Cirrostratus alone: the sky below it is clear, the slider Cirrus full.
+    WeatherNow w;
+    w.valid = true, w.cover = 1.0f, w.high = 1.0f, w.low = 0.0f, w.mid = 0.05f, w.wind = 3.0f, w.code = 3;
+    float clouds = 0, wind = 0, cirrus = 0;
+    weatherSliders(w, clouds, wind, cirrus);
+    fprintf(log, "  %-24s clouds %.2f  wind %.2f  cirrus %.2f\n", "veil of cirrostratus", clouds, wind, cirrus);
   }
   // A response as the service gives it: is it read correctly?
   WeatherNow read;
   bool parsed = parseWeather("{\"latitude\":52.52,\"current_units\":{\"time\":\"iso8601\",\"interval\":\"seconds\",\"cloud_cover\":\"%\"},"
-                             "\"current\":{\"time\":\"2026-11-23T16:15\",\"interval\":900,\"cloud_cover\":75,\"precipitation\":0.30,"
-                             "\"weather_code\":61,\"wind_speed_10m\":5.4,\"wind_gusts_10m\":11.2,\"temperature_2m\":6.8}}",
+                             "\"current\":{\"time\":\"2026-11-23T16:15\",\"interval\":900,\"cloud_cover\":75,\"cloud_cover_low\":20,\"cloud_cover_mid\":30,\"precipitation\":0.30,"
+                             "\"weather_code\":61,\"wind_speed_10m\":5.4,\"wind_direction_10m\":215,\"wind_gusts_10m\":11.2,"
+                             "\"temperature_2m\":6.8,\"cloud_cover_high\":40}}",
                              read);
-  fprintf(log, "Reading a sample response: %s (cloud cover %.2f, precipitation %.1f mm/h, wind %.1f, gusts %.1f, code %d, %.1f degrees)\n",
-          parsed ? "ok" : "ERROR", read.cover, read.rain, read.wind, read.gust, read.code, read.temperature);
+  parsed = parsed && std::fabs(read.windDir - 215) < 0.5f && std::fabs(read.high - 0.4f) < 0.01f && std::fabs(read.low - 0.2f) < 0.01f &&
+           std::fabs(read.mid - 0.3f) < 0.01f;
+  fprintf(log, "Reading a sample response: %s (cloud cover %.2f, high %.2f, precipitation %.1f mm/h, wind %.1f from %.0f, gusts %.1f, code %d, %.1f degrees)\n",
+          parsed ? "ok" : "ERROR", read.cover, read.high, read.rain, read.wind, read.windDir, read.gust, read.code, read.temperature);
   // The place: coordinates as they are, a name through the place search.
   Place place;
   std::string error;
@@ -1925,10 +1946,11 @@ int runWeatherCheck(const std::wstring& dir, const std::wstring& query) {
   WeatherNow now;
   bool ok = fetchWeather(latitude, longitude, now, error);
   if (ok) {
-    float clouds = 0, wind = 0;
-    weatherSliders(now, clouds, wind);
-    fprintf(log, "Request for %.1f %.1f: cloud cover %.0f %%, precipitation %.1f mm/h, wind %.1f m/s, gusts %.1f m/s, code %d, %.1f degrees; clouds %.2f, wind %.2f\n",
-            latitude, longitude, now.cover * 100, now.rain, now.wind, now.gust, now.code, now.temperature, clouds, wind);
+    float clouds = 0, wind = 0, cirrus = 0;
+    weatherSliders(now, clouds, wind, cirrus);
+    fprintf(log, "Request for %.1f %.1f: cloud cover %.0f %% (high %.0f %%), precipitation %.1f mm/h, wind %.1f m/s from %.0f degrees, gusts %.1f m/s, "
+                 "code %d, %.1f degrees; clouds %.2f, cirrus %.2f, wind %.2f\n",
+            latitude, longitude, now.cover * 100, now.high * 100, now.rain, now.wind, now.windDir, now.gust, now.code, now.temperature, clouds, cirrus, wind);
     fprintf(log, "  mean of the day %.1f degrees, visibility %.0f m, snow %.2f m, place at %.0f m; fog %.2f\n", now.dayTemperature, now.visibility,
             now.snowDepth, now.elevation, weatherFog(now));
     float seasonNow = 0, seasonDay = 0;

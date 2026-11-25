@@ -80,7 +80,7 @@ float fogDepth(float dist, float h0, float h1) {
 // Thin fog lies in banks that drift with the wind at the ground: its density
 // around a position (meters from the eye: right, ahead), relative to the mean.
 float fogBank(float2 at) {
-  float2 q = (at - SURF * uStrip.w) * 0.0006;
+  float2 q = (at - uGust.xy) * 0.0006;
   return 0.15 + 1.7 * smoothstep(0.25, 0.75, tNoise.SampleLevel(sWrap, float3(q.x, 0.37, q.y), 0.0).r);
 }
 
@@ -129,7 +129,7 @@ float3 fogLight(float3 v, float open) {
   float glare = uFogCol.w * open * (0.25 + 0.75 * landOpen(uSun));
   // Fog is never even: wisps drift through it with the wind, and upward, where
   // the layer thins and its light comes from, it is brighter.
-  float2 q = (v.xz * (260.0 / (abs(v.y) + 0.2)) - SURF * uStrip.w) * 0.0012;
+  float2 q = (v.xz * (260.0 / (abs(v.y) + 0.2)) - uGust.xy) * 0.0012;
   float wisp = tNoise.SampleLevel(sWrap, float3(q.x, 0.61, q.y), 0.0).r;
   float3 own = uFogCol.rgb * ((0.80 + 0.40 * wisp) * lerp(0.80, 1.12, saturate(0.5 + 2.5 * v.y)));
   // A city behind the fog lights it from within: the light of its lamps is not
@@ -382,6 +382,84 @@ float foamCell(float2 q, float2 dir, float len, float2 id, float2 cell, float sa
   return foam;
 }
 
+// A wave of the wake: its direction, wave number, phase and steepness (amplitude
+// times wave number). Like the waves of the wind: it tilts the surface where the
+// pixel resolves it, otherwise it only roughens it.
+void wakeWave(float2 dir, float k, float phase, float steep, float2 side, float2 fwd, float across, float along, inout float2 slope, inout float2 rough) {
+  if (steep <= 1e-4) return;
+  float2 part = float2(dot(dir, side), dot(dir, fwd));
+  float foot = length(float3(part * float2(across, along), part.x * along * 0.3));
+  float seen = smoothstep(3.0, 7.0, 6.2831853 / (k * foot));
+  slope += dir * (steep * seen * cos(phase));
+  rough += (0.5 * steep * steep * (1.0 - seen * seen)) * part * part;
+}
+
+// The wake of ship or boat i (uWake). In the frame of the vessel: s ahead of its
+// middle, c to its right. Three parts, as photographs show them:
+// - Kelvin's wedge: the waves it raises keep pace with it and fill a wedge of
+//   19.5 degrees to each side behind the bow. Across the track run the
+//   transverse waves, as long as a wave must be to travel at its speed
+//   (2 pi U^2 / g); along the edges of the wedge the diverging waves crowd, at
+//   35 degrees to the track and two thirds that length.
+// - The bow wave: white water pushed aside along the forward part of the hull.
+// - The turbulent wake behind the stern: white close behind it, then a long band
+//   in which the churning has smoothed out the ripples (calm): it mirrors the sky
+//   like still water.
+// A band narrower than the water a pixel covers is spread over that water with
+// the same total: far out it remains a faint line instead of flickering.
+void wakeOf(int i, float2 x, float2 side, float2 fwd, float across, float along, float lod, inout float2 slope, inout float2 rough, inout float calm,
+            inout float foam) {
+  float4 a = uWake[2 * i], b = uWake[2 * i + 1];
+  float2 f = a.zw, r = float2(f.y, -f.x);
+  float2 d = x - a.xy;
+  float s = dot(d, f), c = dot(d, r);
+  float speed = b.x, L = b.y, B = b.z;
+  float aft = L - s, behind = -s - L;
+  if (aft < -B - 2.0 || behind > 25.0 * L + 1500.0 || abs(c) > 0.4 * max(aft, 0.0) + 3.0 * B + 20.0) return;
+  // How much water the pixel covers across the track and along it.
+  float overC = abs(dot(fwd, r)) * along + abs(dot(side, r)) * across;
+  // A ship churns the water white, a small boat hardly.
+  float churn = pow(saturate((speed - 1.0) / 9.0), 1.5);
+
+  // Behind the stern: the band of churned water, widening.
+  float back = max(behind, 0.0);
+  float wide = B * (1.0 + 1.5 * (1.0 - exp(-back / (4.0 * L)))) + 0.01 * back;
+  float wEff = sqrt(wide * wide + 0.25 * overC * overC);
+  float band = exp(-c * c / (wEff * wEff)) * (wide / wEff) * smoothstep(-0.5 * L, 0.0, behind);
+  float still = band * exp(-back / (20.0 * L + 600.0));
+  calm = max(calm, still);
+  slope *= 1.0 - 0.35 * still;
+  rough *= 1.0 - 0.7 * still;
+  float grain = tNoise.SampleLevel(sWrap, float3(x / 7.0, 0.53), lod).a;
+  float white = band * churn * exp(-back / (2.0 * L + 3.0 * speed)) * (0.55 + 0.9 * grain);
+
+  // Along the bow.
+  if (aft > -0.05 * L && aft < 0.8 * L) {
+    float ahead = max(aft, 0.0);
+    float hull = B * sqrt(saturate(ahead / (0.5 * L)));
+    float w = 0.2 * B + 0.4 + 0.04 * ahead;
+    float off = abs(c) - hull - 0.1 * ahead;
+    float wBow = sqrt(w * w + 0.25 * overC * overC);
+    white += 0.9 * churn * exp(-off * off / (wBow * wBow)) * (w / wBow) * exp(-ahead / (0.3 * L)) * (0.7 + 0.6 * grain);
+  }
+  foam = 1.0 - (1.0 - foam) * (1.0 - saturate(white));
+
+  // Kelvin's wedge.
+  if (aft > 0.0) {
+    float k = 9.81 / max(speed * speed, 0.05);
+    float lambda = 6.2831853 / k;
+    float edge = 0.354 * aft;
+    float grow = smoothstep(0.0, 0.6 * L + 0.5 * lambda, aft);
+    float inside = smoothstep(edge, 0.7 * edge, abs(c)) * grow * rsqrt(1.0 + aft / (2.0 * L));
+    wakeWave(f, k, k * aft, 0.05 * inside, side, fwd, across, along, slope, rough);
+    float2 dir = f * 0.8165 + r * (c < 0.0 ? -0.5774 : 0.5774);
+    float kd = 1.5 * k;
+    float rim = (abs(c) - edge) / (0.05 * aft + 0.6 * lambda);
+    float cusp = exp(-rim * rim) * grow * pow(1.0 + aft / (2.0 * L), -0.33);
+    wakeWave(dir, kd, kd * dot(d - f * L, dir), 0.08 * cusp, side, fwd, across, along, slope, rough);
+  }
+}
+
 // The water at a position in the image. cover: coverage (0 above the sea
 // horizon), far: distance in meters.
 float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
@@ -450,13 +528,23 @@ float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
   // Gusts: patches with more and with less wind move with it across the water. In
   // a light wind the water ripples only in individual patches and lies smooth in
   // between; in a fresh wind it is rough everywhere, somewhat more in the gusts.
-  float2 perp = float2(SURF.y, -SURF.x);
-  float2 lee = float2(dot(x, SURF), dot(x, perp));
-  float gust = tNoise.SampleLevel(sWrap, float3((lee.x - uStrip.w) * 0.0006, lee.y * 0.0017, uTime * (14.0 / 3600.0)), 0.0).r;
+  // Axes along the wind and across it; the foam below is fixed on the water in
+  // them, the gust fields move.
+  float2 sea = uSurf.zw, perp = float2(sea.y, -sea.x);
+  float2 lee = float2(dot(x, sea), dot(x, perp));
+  float gust = tNoise.SampleLevel(sWrap, float3((lee.x - uGust.z) * 0.0006, lee.y * 0.0017, uTime * (14.0 / 3600.0)), 0.0).r;
   float wind = lerp(2.4 * smoothstep(0.62, 0.9, gust), 0.45 + 1.1 * gust, saturate(uWind.y / 5.0));
   // Rain roughens the water at small scale: drops make rings.
   rough = rough * wind + calm + 0.010 * uStorm.z * (1.0 - uSnow.x);
   slope = slope * sqrt(wind) + swell;
+
+  // Ships and boats under way leave their wake.
+  float still = 0.0, wakeFoam = 0.0;
+  [branch] if (uWake[1].w > 0.0) {
+    float wakeLod = log2(max(sqrt(along * across), 0.02) * 14.0);
+    wakeOf(0, x, side, fwd, across, along, wakeLod, slope, rough, still, wakeFoam);
+    if (uWake[3].w > 0.0) wakeOf(1, x, side, fwd, across, along, wakeLod, slope, rough, still, wakeFoam);
+  }
 
   // Whitecaps, more in the gusts. Far out a pixel covers many cells: there its
   // distance is divided into pieces; even farther out only the mean brightening
@@ -478,7 +566,7 @@ float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
       float4 grain = tNoise.SampleLevel(sWrap, float3(lee.x / 2.6, lee.y / 6.5, 0.37), lod - 1.0);
       float2 lace = float2(0.55 + 0.45 * smoothstep(0.62, 0.86, grain.g), smoothstep(0.40, 0.60, grain.a));
       float2 q = lee + bend * 6.0;
-      float2 dirW = float2(dot(fwd, SURF), dot(fwd, perp));
+      float2 dirW = float2(dot(fwd, sea), dot(fwd, perp));
       int steps = clamp(int(ceil(along / 12.0)), 1, 8);
       float piece = along / float(steps);
       [loop] for (int st = 0; st < steps; st++) {
@@ -506,6 +594,8 @@ float3 water(float2 p, float3 v, float3 haze, out float cover, out float far) {
     }
     foam = lerp(foam, odds * uWind.w, away);
   }
+  // In the smoothed band behind a ship no wave breaks.
+  foam = 1.0 - (1.0 - foam * (1.0 - still)) * (1.0 - wakeFoam);
 
   float3 ex = normalize(cross(up, float3(0.0, 0.0, 1.0)));   // east of the surface
   float3 ez = cross(ex, up);
@@ -670,7 +760,7 @@ void ground(float2 p, float3 v, float2 uv, float3 sky, float4 cloud, float2 clou
   landLights = 0.0;
   if (uGround.x + uGround.y < 0.5) return;
   // State of the clouds now: for their shadow on the land.
-  cloudShift = uCloudT;
+  cloudDrift = uDrift;
   cloudAge = uEvolve;
   float3 haze = tHaze.SampleLevel(sClamp, float2(uv.x, 0.5), 0.0).rgb;
   // Below clouds the haze is gray like them, not blue like the sky; in a

@@ -53,8 +53,8 @@ SP-1200. ESA distributes it under CC BY-NC 3.0 IGO and asks for the credit
 
 ## Models
 
-The ships, the dinghy, the airliner and the gull (`models/`) are the work of
-their authors, converted for this program: fewer triangles, smaller textures
+The ships, the dinghy with its crew, the airliner and the gull (`models/`) are
+the work of their authors, converted for this program: fewer triangles, smaller textures
 with the base colours only, scaled to metres. Further changes are listed in
 [models/SOURCES.txt](models/SOURCES.txt).
 
@@ -63,6 +63,7 @@ with the base colours only, scaled to metres. Further changes are listed in
 | Container ship | ["Container Ship"](https://sketchfab.com/3d-models/container-ship-aaa41cca946b4a08bc08cf692b7757be) by [RM02](https://sketchfab.com/RM02) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
 | Freighter | ["Cargo ship"](https://sketchfab.com/3d-models/cargo-ship-b7c97df584824ca682d26daabf401f87) by [hungry_drifter](https://sketchfab.com/hungry_drifter) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
 | Sailing dinghy | ["Yacht"](https://sketchfab.com/3d-models/yacht-ae42c1609c25412cbfe40baf9728d987) by [MesXwi](https://sketchfab.com/MesXwi) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
+| Crew of the dinghy | ["Man"](https://poly.pizza/m/HMnuH5geEG) by [Quaternius](https://quaternius.com) | [CC0 1.0](http://creativecommons.org/publicdomain/zero/1.0/) |
 | Gull | ["seagull v1"](https://sketchfab.com/3d-models/seagull-v1-f3fa166ff6bd4ffe8133f6f6eed74d64) by [Julian Johnson-Mortimer](https://sketchfab.com/FreddyFoxFreddy) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) |
 | Airliner | ["Boeing 737-200 — European Aviation G-CEAH"](https://sketchfab.com/3d-models/boeing-737-200-european-aviation-g-ceah-e3224d0aa8c54f41a612ac74e35e045e) by [mgg8](https://sketchfab.com/mgg8) | [CC0 1.0](http://creativecommons.org/publicdomain/zero/1.0/) |
 

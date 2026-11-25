@@ -51,6 +51,12 @@ bool parseWeather(const std::string& json, WeatherNow& out) {
   number(now, "interval", span);
   number(now, "weather_code", code);
   number(now, "wind_gusts_10m", w.gust);
+  number(now, "wind_direction_10m", w.windDir);
+  float high = 0;
+  if (number(now, "cloud_cover_high", high)) w.high = std::clamp(high / 100, 0.0f, 1.0f);
+  float part = 0;
+  if (number(now, "cloud_cover_low", part)) w.low = std::clamp(part / 100, 0.0f, 1.0f);
+  if (number(now, "cloud_cover_mid", part)) w.mid = std::clamp(part / 100, 0.0f, 1.0f);
   number(now, "temperature_2m", w.temperature);
   number(now, "visibility", w.visibility);
   number(now, "snow_depth", w.snowDepth);
@@ -77,10 +83,10 @@ bool parseWeather(const std::string& json, WeatherNow& out) {
 }
 
 bool fetchWeather(double latitude, double longitude, WeatherNow& out, std::string& error) {
-  wchar_t path[320];
+  wchar_t path[400];
   swprintf_s(path,
-             L"/v1/forecast?latitude=%.1f&longitude=%.1f&current=cloud_cover,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,temperature_2m,"
-             L"visibility,snow_depth&daily=temperature_2m_mean&forecast_days=1&timezone=auto&wind_speed_unit=ms",
+             L"/v1/forecast?latitude=%.1f&longitude=%.1f&current=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,weather_code,wind_speed_10m,wind_direction_10m,"
+             L"wind_gusts_10m,temperature_2m,visibility,snow_depth&daily=temperature_2m_mean&forecast_days=1&timezone=auto&wind_speed_unit=ms",
              coarse(latitude), coarse(longitude));
   std::string body;
   if (!httpGet(HOST, path, body, error)) return false;
@@ -91,10 +97,15 @@ bool fetchWeather(double latitude, double longitude, WeatherNow& out, std::strin
   return true;
 }
 
-void weatherSliders(const WeatherNow& w, float& clouds, float& wind) {
+void weatherSliders(const WeatherNow& w, float& clouds, float& wind, float& cirrus) {
+  // The slider Clouds stands for the low and middle clouds; the high ones have the
+  // slider Cirrus. A sky covered by cirrostratus alone is clear below it. The
+  // layers overlap at random.
+  float cover = w.low >= 0 && w.mid >= 0 ? 1 - (1 - w.low) * (1 - w.mid) : w.cover;
+  cirrus = std::clamp(w.high, 0.0f, 1.0f);
   // Up to almost fully covered the slider follows the cloud cover; a closed cloud
   // deck is above 100 %.
-  float sky = w.cover < 0.9f ? w.cover * 0.95f / 0.9f : 0.95f + (w.cover - 0.9f) * 2.5f;
+  float sky = cover < 0.9f ? cover * 0.95f / 0.9f : 0.95f + (cover - 0.9f) * 2.5f;
   bool thunder = w.code >= 95;
   // Rain and snow alike: something falls. The sky draws it as snow when it is
   // cold enough.

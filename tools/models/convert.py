@@ -29,6 +29,11 @@ What models.json says per model:
   thin       materials that light shines through: sailcloth, feathers
   lights     lamps for the night: kind (see LAMPS), then position in meters in the finished model (right, up,
              forward), optionally the phase of its flashing (0 to 1)
+  crew       people set into the model, each in a fixed pose: source (a .glb file below the folder with the
+             sources), forward and up as above, action (name of an animation in it) and frame, height in meters
+             when standing, at (where the hips go, meters in the finished model: right, up, forward), turn (where
+             the person faces, degrees clockwise from forward seen from above) and colors (linear color per
+             material name; the others keep theirs)
 """
 import json
 import math
@@ -90,6 +95,78 @@ def layer_pixels(path, size, see_through):
     if not see_through:
         px[:, :, 3] = 1
     return np.clip(np.rint(px * 255), 0, 255).astype(np.uint8)
+
+
+def figure(entry, sources):
+    """A person in a fixed pose, in the frame of the finished model: per corner of its triangles position, normal
+    and color (linear)."""
+    before = set(bpy.data.objects)
+    bpy.ops.import_scene.gltf(filepath=os.path.join(sources, entry['source']))
+    new = [o for o in bpy.data.objects if o not in before]
+    arm = next(o for o in new if o.type == 'ARMATURE')
+    body = [o for o in new if o.type == 'MESH' and o.parent == arm]
+
+    def corners():
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        pos, nrm, col = [], [], []
+        for o in body:
+            ev = o.evaluated_get(depsgraph)
+            me = ev.to_mesh()
+            me.calc_loop_triangles()
+            world = np.array(ev.matrix_world)
+            co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+            me.vertices.foreach_get('co', co)
+            co = co.reshape(-1, 3) @ world[:3, :3].T + world[:3, 3]
+            cn = np.empty(len(me.loops) * 3, dtype=np.float32)
+            me.corner_normals.foreach_get('vector', cn)
+            cn = cn.reshape(-1, 3) @ np.linalg.inv(world[:3, :3])
+            tri_loops = np.empty(len(me.loop_triangles) * 3, dtype=np.int32)
+            me.loop_triangles.foreach_get('loops', tri_loops)
+            tri_verts = np.empty(len(me.loop_triangles) * 3, dtype=np.int32)
+            me.loop_triangles.foreach_get('vertices', tri_verts)
+            tri_mat = np.empty(len(me.loop_triangles), dtype=np.int32)
+            me.loop_triangles.foreach_get('material_index', tri_mat)
+            colors = []
+            for m in o.data.materials:
+                c = entry.get('colors', {}).get(m.name) if m else None
+                if c is None:
+                    bsdf = m.node_tree.nodes.get('Principled BSDF') if m and m.use_nodes else None
+                    c = list(bsdf.inputs['Base Color'].default_value)[:3] if bsdf else [0.5, 0.5, 0.5]
+                colors.append(c)
+            pos.append(co[tri_verts])
+            nrm.append(cn[tri_loops])
+            col.append(np.array(colors, dtype=np.float64)[np.repeat(tri_mat, 3)])
+            ev.to_mesh_clear()
+        return np.concatenate(pos), np.concatenate(nrm), np.concatenate(col)
+
+    # The size from the person standing at rest, then the pose.
+    data = arm.animation_data or arm.animation_data_create()
+    for track in list(data.nla_tracks):
+        data.nla_tracks.remove(track)
+    arm.data.pose_position = 'REST'
+    rest, _, _ = corners()
+    up = np.array(AXES[entry['up']], dtype=np.float64)
+    scale = entry['height'] / float(np.ptp(rest @ up))
+    arm.data.pose_position = 'POSE'
+    action = next(a for a in bpy.data.actions if a.name.split('|')[-1] == entry['action'])
+    data.action = action
+    if hasattr(data, 'action_slot') and getattr(action, 'slots', None):
+        data.action_slot = action.slots[0]
+    bpy.context.scene.frame_set(int(entry.get('frame', 0)))
+    pos, nrm, col = corners()
+    hips = np.array(arm.matrix_world @ arm.pose.bones['Hips'].head)
+    for o in new:
+        bpy.data.objects.remove(o, do_unlink=True)
+
+    f = np.array(AXES[entry['forward']], dtype=np.float64)
+    frame = np.stack([np.cross(f, up), up, f])
+    turn = math.radians(entry.get('turn', 0))
+    # Clockwise seen from above: forward turns toward the right.
+    spin = np.array([[math.cos(turn), 0, math.sin(turn)], [0, 1, 0], [-math.sin(turn), 0, math.cos(turn)]])
+    pos = ((pos - hips) @ frame.T) * scale @ spin.T + np.array(entry['at'])
+    nrm = nrm @ frame.T @ spin.T
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-9)
+    return pos, nrm, col
 
 
 def convert(name, spec, sources):
@@ -191,6 +268,23 @@ def convert(name, spec, sources):
         srgb = [255 * (c ** (1 / 2.2)) for c in factor[:3]]
         tint[i] = (round(srgb[0]), round(srgb[1]), round(srgb[2]), index[key])
     corner_tint, corner_thin = tint[corner_slot], thin[corner_slot]
+
+    # People on board, colored by their materials on a white layer.
+    for entry in spec.get('crew', []):
+        fpos, fnrm, fcol = figure(entry, sources)
+        key = (None, False)
+        if key not in index:
+            index[key] = len(layers)
+            layers.append(np.full((size, size, 4), 255, dtype=np.uint8))
+        ftint = np.zeros((len(fpos), 4), dtype=np.uint8)
+        ftint[:, :3] = np.clip(np.rint(255 * np.power(np.clip(fcol, 0, 1), 1 / 2.2)), 0, 255)
+        ftint[:, 3] = index[key]
+        pos = np.concatenate([pos, fpos])
+        normal = np.concatenate([normal, fnrm])
+        uv = np.concatenate([uv, np.zeros((len(fpos), 2), dtype=uv.dtype)])
+        corner_tint = np.concatenate([corner_tint, ftint])
+        corner_thin = np.concatenate([corner_thin, np.zeros(len(fpos), dtype=corner_thin.dtype)])
+        print('CREW %s: %d triangles at %s' % (entry['action'], len(fpos) // 3, entry['at']))
 
     # Triangles turned around, equal corners merged.
     turn = (np.arange(len(pos)).reshape(-1, 3)[:, ::-1]).ravel()

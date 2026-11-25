@@ -94,7 +94,9 @@ struct Params {
   float moonRadius = 0.0f;    // Moon size, likewise
   float rays = 0.3f;          // Rays: fine ray needles around the sun
   float clouds = 0.5f;        // Clouds: up to 1 more clouds, above that overcast, rain, thunderstorm (up to 2)
+  float cirrus = 0.3f;        // Cirrus: high ice clouds; from about half on a closed veil with halos
   float wind = 0.5f;          // Wind
+  float windDir = 253.3f;     // Wind direction: where the wind comes from, degrees from north through east
   float fog = 0.0f;           // Fog: 0 none, up to 1 a visibility of 100 m
   float temperature = 12.0f;  // degrees Celsius at the viewer: around freezing, snow falls instead of rain
   float dayTemperature = 12.0f;   // its mean over the day: decides where snow lies
@@ -112,6 +114,7 @@ struct Params {
   float glow = 2.0f;          // HDR glow: brightness of the sun as a multiple of white, 1 = off
   float ground = 0.0f;        // Ground: 0 Mountains, 1 Skyline, 2 Sea
   float life = 0.5f;          // Life: how often a ship, an aircraft or birds pass, 0 = never
+  float facing = 180;         // where the image looks, degrees from north: south in the northern hemisphere, north in the southern; not a setting
   float resolution = 0.5f;    // resolution of the scattered light
   int steps = 40;             // steps of the scattered light
   bool operator==(const Params&) const = default;
@@ -169,7 +172,7 @@ class Renderer {
   const Params& params() const { return par_; }
   // Clouds and wind glide to these values without the sky starting over (live
   // weather).
-  void drift(float clouds, float wind);
+  void glide(float clouds, float cirrus, float wind, float windDir);
   // Likewise fog, temperature and snow: the image follows without anything
   // starting over.
   void drift(float fog, float temperature, float dayTemperature, float snowDepth);
@@ -241,16 +244,33 @@ class Renderer {
   float rainHere() const { return rainHere_; }
   // Radius of the disk that is shining right now.
   float sunRadius() const { return light_.moon ? moonRad_ : sunRad_; }
-  void seek(double cloudShift) { cloudT_ = cloudShift; started_ = true; skyDirty_ = true; }
+  // How far the wind has shifted the cloud field, meters in the frame of the
+  // image (x to the right, z ahead): for the cumulus and for the cirrus.
+  struct Drift {
+    double low[2] = {}, high[2] = {};
+    bool operator==(const Drift&) const = default;
+  };
+  // For still images: the clouds as they are after this many units of shift along
+  // the wind as it blows now.
+  void seek(double cloudShift);
   // For debugging: where the newest cloud image knows a distance (blue) and where
   // the one extended into the neighborhood does (green), nearer clouds brighter.
   // As an image at the resolution of the clouds, BGRA from the top.
   bool dumpDepth(std::vector<uint8_t>& bgra, int& w, int& h);
   // State of the clouds: wind shift and time of their evolution. For reproducing a
   // moment.
-  double cloudShift() const { return cloudT_; }
+  Drift cloudDrift() const { return drift_; }
   double cloudAge() const { return evolveT_; }
-  void seek(double cloudShift, double age) { cloudT_ = cloudShift; evolveT_ = age; started_ = true; skyDirty_ = true; }
+  void seek(const Drift& drift, double age) {
+    drift_ = drift;
+    evolveT_ = age;
+    started_ = true;
+    skyDirty_ = true;
+  }
+  void seek(double cloudShift, double age) {
+    seek(cloudShift);
+    evolveT_ = age;
+  }
   // For still images: exactly these ships, aircraft and birds are in the image
   // (see Life::stage).
   void stage(const std::vector<Life::Staged>& list) { life_.stage(list); }
@@ -267,8 +287,13 @@ class Renderer {
   struct Pass {
     float share = 1;
     int steps = 0;
-    float shift = 0, jit = 0, subX = 0, subY = 0, evolve = 0;
-    float wind = 0;   // the wind that shapes the clouds of this pass: the same for all its bands
+    float jit = 0, subX = 0, subY = 0, evolve = 0;
+    // The wind that moves and shapes the clouds of this pass: the same for all its
+    // bands.
+    Drift drift;
+    float wind = 0;
+    double windVec[4] = {};
+    double lean[2] = {};
     int band = 0;
   };
   // A window over time: whether it is moving right now, has just appeared or has
@@ -373,7 +398,9 @@ class Renderer {
   void updateLight();
   void updateDepths();
   void trackScene(const std::vector<Occluder>& list);
-  void fillSky(struct SkyC& c, int w, int h, int steps, float shift, float jit, float subX, float subY, float show);
+  void fillSky(struct SkyC& c, int w, int h, int steps, float jit, float subX, float subY, float show);
+  void updateWind();
+  void turnSea(bool now);
   void fillLight(struct LightC& c);
   void target(ID3D11RenderTargetView* rtv, int w, int h);
   void quad(ID3D11PixelShader* ps);
@@ -453,6 +480,7 @@ class Renderer {
   // lights) and the waves of the water.
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> land_[4];
   Microsoft::WRL::ComPtr<ID3D11SamplerState> wide_;
+  Microsoft::WRL::ComPtr<ID3D11SamplerState> shadowCmp_;   // compares with a shadow map
   Microsoft::WRL::ComPtr<ID3D11Buffer> waveBuf_;
   std::vector<float> wave_;       // the wave trains: height, angular frequency, wave vector
   std::vector<float> waveUnit_;   // per wave train: its steepness relative to the others
@@ -460,7 +488,18 @@ class Renderer {
   float seaWind_ = -1;            // position of the wind slider for which the wave heights apply
   float foamOdds_ = 0;            // how often a wave breaks in a cell of the water, 0 to 1
   float foamCover_ = 0;           // fraction of the water under foam
-  double gustT_ = 0;              // the gust fields have moved this far over the water, meters
+  double fogT_[2] = {};           // the banks of fog have drifted this far with the wind at the ground, meters (right, ahead)
+  double gustT_ = 0;              // the gust fields have moved this far over the water along the waves, meters
+  // The wind in the frame of the image (x to the right, z ahead), from its
+  // direction (updateWind). windVec_: shift of the cloud field per unit of shift,
+  // meters, cumulus x, z and cirrus x, z; surf_: where the wind at the ground blows
+  // to; lean_: how far the cumulus lean, meters sideways per meter of height.
+  double windVec_[4] = {6400, 1920, 11200, -2880};
+  double surf_[2] = {-0.747, -0.665};
+  double lean_[2] = {};
+  // The direction the waves were made for. They follow the wind in steps: a
+  // field of waves cannot turn smoothly without jumping in the distance.
+  double seaDir_[2] = {-0.747, -0.665};
   double dustT_ = 0;              // the wind has carried the dust this far, logical pixels
   int groundLoaded_ = -1;   // which ground is loaded
   std::vector<uint8_t> weatherMap_;   // the weather map of the clouds, RGBA
@@ -514,6 +553,10 @@ class Renderer {
   Microsoft::WRL::ComPtr<ID3D11RenderTargetView> propRtv_;
   Microsoft::WRL::ComPtr<ID3D11DepthStencilView> propDsv_;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> propSrv_;
+  // The shadow map of the model being drawn, seen from the light source.
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilView> shadowDsv_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> shadowSrv_;
+  Microsoft::WRL::ComPtr<ID3D11VertexShader> vsPropShadow_;
   int propSamples_ = 0;            // samples per pixel there; -1: the graphics card offers none
 
   Target base_;     // sky without clouds, at the resolution of the clouds
@@ -525,14 +568,14 @@ class Renderer {
   Target near_[3];   // distance of the frontmost cloud in the neighborhood, at a quarter of the resolution
   Target nearBlock_; // intermediate stage for that
   int airNew_ = 0, airOld_ = 2, airWork_ = 1;
-  double airShiftOf_[3] = {};   // wind shift for which each of the images applies
-  double airLeanOf_[3] = {};    // and how far its cumulus lean with the wind (tangent)
+  Drift airDriftOf_[3];         // wind shift for which each of the images applies
+  double airLeanOf_[3][2] = {}; // and how far its cumulus lean with the wind
   double shapeMoved_ = -1e9;    // when the weather last changed the shapes of the clouds
   // Where what is now in the cloud image was in the stored ones, and for which
   // state of the clouds it was made.
   Target flow_;
   int airSerial_ = 0, flowSerial_ = -1;
-  double flowShift_ = 0;
+  Drift flowDrift_;
   bool flowFading_ = false;
   int airDone_ = 0;             // finished passes since the last user change
   int sinceSwitch_ = 0;         // frames since the last finished pass
@@ -593,7 +636,8 @@ class Renderer {
   bool skyDirty_ = true, sceneDirty_ = true, started_ = false, passActive_ = false;
   int accum_ = 0, shot_ = 0, skyAccum_ = 0, skyShot_ = 0;
   Pass pass_;
-  double time_ = 0, cloudT_ = 0, skyTime_ = 0;
+  Drift drift_;           // how far the wind has shifted the clouds
+  double time_ = 0, skyTime_ = 0;
   double evolveT_ = 0;    // time with which the shapes evolve
   int faceTick_ = 0;
   bool faceDue_ = false;   // the finished image is to be made anew without the clouds starting over

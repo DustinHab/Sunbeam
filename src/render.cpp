@@ -44,6 +44,7 @@
 #include "sh/prop.h"
 #include "sh/propin.h"
 #include "sh/propvs.h"
+#include "sh/propshadowvs.h"
 #include "sh/rain.h"
 #include "sh/far.h"
 #include "sh/resolve.h"
@@ -58,12 +59,12 @@ struct SkyC {
   float res[2], view[2];
   float sun[2], sub[2];
   float sunR, focal, horizon, clouds;
-  float night, day, cloudT, jit;
+  float night, day, cirrus, jit;
   float sunCol[3], exposure;
   float sunDir[3], show;
   float amb[3];
   int32_t cloudSteps;
-  float span, count, share, back;
+  float span, count, share, unusedB;
   float evolve, skyGain, time, town;
   float sunAtm[3], srcMoon;
   float cloudCol[3], moonLit;
@@ -71,7 +72,7 @@ struct SkyC {
   float discCol[3], moonSpin;
   float moonCol[3], widen;
   float fill[3], cover;
-  float moon[2], backOld, fade;
+  float moon[2], unusedC, fade;
   float after[3], moonR;
   float shape[4];
   float ground[4];
@@ -88,8 +89,16 @@ struct SkyC {
   float snow[4];
   float fog[4];
   float fogCol[4];
+  float drift[4];
+  float back[4];
+  float backOld[4];
+  float windVec[4];
+  float lean[4];
+  float surf[4];
+  float gust[4];
+  float wake[4][4];
 };
-static_assert(sizeof(SkyC) == 512);
+static_assert(sizeof(SkyC) == 688);
 
 const int WAVES = 160;   // as in shader\ground.hlsli
 const int SWELL = 8;     // the last of them are swell
@@ -143,6 +152,7 @@ struct PropC {
   float light[4];
   float wing[4];
   float axis[4];
+  float shade[4];
 };
 
 // A model as it is in the resources: this head, then the vertices (position,
@@ -208,11 +218,10 @@ const float COVER_STORM = 0.53f;
 const double DUST_PER_MP = 880;     // dust particles per million logical pixels at full slider
 const double CLOUD_TILE = 6400;     // meters per tile of the noise, as in sky.hlsl
 const double WIND_MAX = 40;         // meters per second at full slider
-const double CLOUD_WRAP = 625;      // after this many tiles of shift the clouds are the same again
+const double DRIFT_WRAP = 4e6;      // after this many meters of shift in either direction weather map and noise of the clouds repeat
 // The wind at the ground blows rotated by 25 degrees against the drift of the
 // clouds, towards the viewer, and weaker: the friction at the ground slows and
 // turns it.
-const double SURF_X = -0.747, SURF_Z = -0.665;   // its direction (right, ahead), as in sky.hlsl
 const double SURF_MAX = 17;         // meters per second at the ground at full slider
 const double RAIN_SPEED = 8;        // the drops fall this fast, meters per second
 const double SNOW_SPEED = 1.4;      // and snowflakes this fast
@@ -288,6 +297,8 @@ const Model MODELS[MODEL_COUNT] = {
 // The work image for one model. If the model is smaller in the image, several of
 // its pixels fall on one pixel of the image, up to PROP_FINE per axis.
 const int PROP_W = 768, PROP_H = 512, PROP_FINE = 4;
+// Edge length of the shadow map of a model, as SHADOW_SIZE in sky.hlsl.
+const int SHADOW_SIZE = 1024;
 // A lamp of strength 1 at one kilometer is this bright in its center, as a
 // multiple of white before exposure; LAMP_PEAK is the most a disc holds.
 const double LAMP_GAIN = 300, LAMP_PEAK = 6;
@@ -587,6 +598,7 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   hr |= dev_->CreateVertexShader(sh_boltvs, sizeof(sh_boltvs), nullptr, &vsBolt_);
   hr |= dev_->CreateVertexShader(sh_boltfarvs, sizeof(sh_boltfarvs), nullptr, &vsBoltFar_);
   hr |= dev_->CreateVertexShader(sh_propvs, sizeof(sh_propvs), nullptr, &vsProp_);
+  hr |= dev_->CreateVertexShader(sh_propshadowvs, sizeof(sh_propshadowvs), nullptr, &vsPropShadow_);
   const D3D11_INPUT_ELEMENT_DESC vertex[] = {
       {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
       {"NORMAL", 0, DXGI_FORMAT_R8G8B8A8_SNORM, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -654,6 +666,15 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   sd.MaxAnisotropy = 16;
   sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
   dev_->CreateSamplerState(&sd, &wide_);
+  // For shadow maps: the fraction of the neighboring texels that lie nearer the
+  // light; beyond the edge of the map everything is lit.
+  D3D11_SAMPLER_DESC cmp = {};
+  cmp.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+  cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+  cmp.BorderColor[0] = cmp.BorderColor[1] = cmp.BorderColor[2] = cmp.BorderColor[3] = 1;
+  cmp.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+  cmp.MaxLOD = D3D11_FLOAT32_MAX;
+  dev_->CreateSamplerState(&cmp, &shadowCmp_);
 
   D3D11_BLEND_DESC bd = {};
   bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -1037,8 +1058,8 @@ bool Renderer::loadClouds() {
 void Renderer::bindCommon() {
   ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   ctx_->IASetInputLayout(nullptr);
-  ID3D11SamplerState* samplers[3] = {clamp_.Get(), wrap_.Get(), wide_.Get()};
-  ctx_->PSSetSamplers(0, 3, samplers);
+  ID3D11SamplerState* samplers[4] = {clamp_.Get(), wrap_.Get(), wide_.Get(), shadowCmp_.Get()};
+  ctx_->PSSetSamplers(0, 4, samplers);
   ctx_->VSSetSamplers(0, 2, samplers);
   ID3D11ShaderResourceView* moon[2] = {moon_.Get(), relief_.Get()};
   ctx_->PSSetShaderResources(13, 2, moon);
@@ -1097,8 +1118,8 @@ void Renderer::resize(int pixelW, int pixelH, float scale) {
     air_[i] = makeTarget(aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
     airZ_[i] = makeTarget(aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
     near_[i] = makeTarget((aw + 3) / 4, (ah + 3) / 4, DXGI_FORMAT_R16_FLOAT, false);
-    airShiftOf_[i] = cloudT_;
-    airLeanOf_[i] = leanOf(par_.wind);
+    airDriftOf_[i] = drift_;
+    airLeanOf_[i][0] = lean_[0], airLeanOf_[i][1] = lean_[1];
   }
   nearBlock_ = makeTarget((aw + 3) / 4, (ah + 3) / 4, DXGI_FORMAT_R16_FLOAT, false);
   // Offsets, small numbers: half precision is enough for them.
@@ -1520,7 +1541,7 @@ void Renderer::setOutput(bool linear, float white) {
 
 void Renderer::setParams(const Params& p) {
   if (p == par_) return;
-  bool sky = p.clouds != par_.clouds || p.sunRadius != par_.sunRadius || p.moonRadius != par_.moonRadius || p.rays != par_.rays ||
+  bool sky = p.clouds != par_.clouds || p.cirrus != par_.cirrus || p.sunRadius != par_.sunRadius || p.moonRadius != par_.moonRadius || p.rays != par_.rays ||
              p.moonlight != par_.moonlight || p.ground != par_.ground;
   // The stars are an image of their own: only it is made anew.
   if (p.stars != par_.stars) nightDirty_ = faceDue_ = true;
@@ -1530,12 +1551,18 @@ void Renderer::setParams(const Params& p) {
     skyAccum_ = std::min(skyAccum_, 3);
     shapeMoved_ = time_;
   }
+  // A new direction of the wind turns the lean of the clouds and the waves at
+  // once: the sky starts over.
+  bool turned = p.windDir != par_.windDir || p.facing != par_.facing;
+  sky = sky || turned;
   bool res = p.resolution != par_.resolution;
   // The haze also lies between eye and ground: the finished image needs it anew,
   // the clouds do not. The same goes for fog and for what the temperature decides.
   bool air = p.fog != par_.fog || p.temperature != par_.temperature || p.dayTemperature != par_.dayTemperature || p.snowDepth != par_.snowDepth;
   if (p.density != par_.density || air) faceDue_ = true;
   par_ = p;
+  updateWind();
+  if (turned) turnSea(true);
   if (!dev_ || !sky_.tex) return;
   sizeBodies();
   if (res) allocScatter();
@@ -1562,24 +1589,64 @@ void Renderer::drift(float fog, float temperature, float dayTemperature, float s
   faceDue_ = true;
 }
 
-// Shared quantities of the sky shaders. shift is the wind shift of the clouds,
-// jit and sub offset the sampling per pass.
 // The weather changes by itself (live weather): clouds and wind glide in small
 // steps. Nothing starts over, the next cloud passes pick up the new state.
-void Renderer::drift(float clouds, float wind) {
-  if (clouds == par_.clouds && wind == par_.wind) return;
-  bool cloudsMoved = clouds != par_.clouds;
+void Renderer::glide(float clouds, float cirrus, float wind, float windDir) {
+  if (clouds == par_.clouds && cirrus == par_.cirrus && wind == par_.wind && windDir == par_.windDir) return;
+  bool cloudsMoved = clouds != par_.clouds || cirrus != par_.cirrus;
   par_.clouds = clouds;
+  par_.cirrus = cirrus;
   par_.wind = wind;
+  par_.windDir = windDir;
+  updateWind();
+  turnSea(false);
   if (!dev_ || !sky_.tex) return;
   updateLight();
   heavenMoved_ = true;
   shapeMoved_ = time_;
   // If the clouds stand still, no new pass would be made otherwise.
-  if (cloudsMoved && !(wind > 0 && clouds > 0)) skyAccum_ = std::min(skyAccum_, SKY_ACC / 2);
+  if (cloudsMoved && !(wind > 0 && (clouds > 0 || cirrus > 0))) skyAccum_ = std::min(skyAccum_, SKY_ACC / 2);
 }
 
-void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit, float subX, float subY, float show) {
+// The wind in the frame of the image from its direction: x to the right, z ahead.
+// The image looks south in the northern hemisphere. There the wind turns to the
+// right with height, the cirrus by 31 degrees against the cumulus, and to the
+// left near the ground, by 25 degrees (friction); in the southern hemisphere the
+// other way round. The lengths keep the speeds the clouds always had.
+void Renderer::updateWind() {
+  const double low = 6400 * 1.04403, high = 6400 * 1.80693;
+  double toward = (par_.windDir + 180 - par_.facing) * PI / 180, turn = par_.facing > 90 ? 1 : -1;
+  double up = toward + turn * 31.1 * PI / 180, down = toward - turn * 25 * PI / 180;
+  windVec_[0] = -std::sin(toward) * low, windVec_[1] = -std::cos(toward) * low;
+  windVec_[2] = -std::sin(up) * high, windVec_[3] = -std::cos(up) * high;
+  surf_[0] = std::sin(down), surf_[1] = std::cos(down);
+  double lean = leanOf(par_.wind);
+  lean_[0] = lean * std::sin(toward), lean_[1] = lean * std::cos(toward);
+}
+
+// The waves follow the wind at the ground. now: at once (the user has turned it);
+// otherwise only once it has turned by more than 20 degrees from the waves (live
+// weather, in small steps): a field of waves cannot turn smoothly, its distant
+// part would jump with every step.
+void Renderer::turnSea(bool now) {
+  double dot = seaDir_[0] * surf_[0] + seaDir_[1] * surf_[1];
+  if (!now && dot > std::cos(20 * PI / 180)) return;
+  if (dot > 0.999999) return;
+  seaDir_[0] = surf_[0], seaDir_[1] = surf_[1];
+  if (dev_ && GROUNDS[groundOf(par_)].water && groundLoaded_ == groundOf(par_)) {
+    makeWaves();
+    mapTick_ = 0;
+    faceDue_ = true;
+  }
+}
+
+void Renderer::seek(double cloudShift) {
+  for (int i = 0; i < 2; i++) drift_.low[i] = cloudShift * windVec_[i], drift_.high[i] = cloudShift * windVec_[2 + i];
+  started_ = true;
+  skyDirty_ = true;
+}
+
+void Renderer::fillSky(SkyC& c, int w, int h, int steps, float jit, float subX, float subY, float show) {
   c = {};
   c.res[0] = float(w), c.res[1] = float(h);
   c.view[0] = viewW_, c.view[1] = viewH_;
@@ -1593,16 +1660,29 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.focal = focal();
   c.horizon = horizon();
   c.clouds = par_.clouds;
+  c.cirrus = par_.cirrus;
+  // Ships and boats under way draw their wake on the water (wakeOf in
+  // shader\ground.hlsli): where they are, where they head, how fast, how long and
+  // wide their hull is.
+  if (GROUNDS[groundOf(par_)].water) {
+    int k = 0;
+    for (const Prop& p : props_) {
+      const Mesh& m = mesh_[p.model];
+      if (k >= 2 || !MODELS[p.model].afloat || !m.vertices || p.speed < 0.1f) continue;
+      float* at = c.wake[2 * k];
+      float* hull = c.wake[2 * k + 1];
+      at[0] = float(p.pos[0]), at[1] = float(p.pos[2]), at[2] = std::sin(p.heading), at[3] = std::cos(p.heading);
+      hull[0] = p.speed, hull[1] = 0.5f * (m.hi[2] - m.lo[2]), hull[2] = 0.5f * (m.hi[0] - m.lo[0]), hull[3] = 1;
+      k++;
+    }
+  }
   c.night = l.night;
   c.day = l.day;
-  c.cloudT = shift;
   c.jit = jit;
   c.exposure = l.exposure;
   c.show = show;
   c.cloudSteps = steps;
   c.share = 1;
-  c.back = float(cloudT_ - airShiftOf_[airNew_]);
-  c.backOld = float(cloudT_ - airShiftOf_[airOld_]);
   c.fade = fade_;
   c.evolve = float(evolveT_);
   c.skyGain = l.gain;
@@ -1655,9 +1735,7 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.strip[0] = STRIP_TOP, c.strip[1] = STRIP_SPAN;
   c.strip[2] = l.lights;
   c.land[3] = land_[3] ? 1.0f : 0.0f;
-  // The wind at the ground: how far the gust fields have moved over the water, how
-  // slanted the rain falls, how often waves break.
-  c.strip[3] = float(gustT_);
+  // The wind at the ground: how slanted the rain falls, how often waves break.
   c.wind[0] = float(std::min(surfSpeed() / fallSpeed(), 3.0));
   // Flakes close to the viewer fall slower still and nearly ride on the wind.
   c.snow[3] = float(std::min(surfSpeed() / SNOW_SPEED, 4.0));
@@ -1665,9 +1743,23 @@ void Renderer::fillSky(SkyC& c, int w, int h, int steps, float shift, float jit,
   c.wind[2] = foamOdds_;
   c.wind[3] = foamCover_;
   for (int i = 0; i < 3; i++) c.sunLand[i] = l.land[i], c.skyLand[i] = l.skyLand[i], c.sea[i] = g.sea[i];
-  // For the final image: how much more the newest cloud image leans than the one
-  // before, which is faded into it.
-  c.sea[3] = float(airLeanOf_[airNew_] - airLeanOf_[airOld_]);
+  // The wind: the shift of the clouds now and since the stored images, its
+  // direction, the lean of the cumulus, the wind at the ground and the gust fields.
+  for (int i = 0; i < 2; i++) {
+    c.drift[i] = float(drift_.low[i]), c.drift[2 + i] = float(drift_.high[i]);
+    c.back[i] = float(drift_.low[i] - airDriftOf_[airNew_].low[i]);
+    c.back[2 + i] = float(drift_.high[i] - airDriftOf_[airNew_].high[i]);
+    c.backOld[i] = float(drift_.low[i] - airDriftOf_[airOld_].low[i]);
+    c.backOld[2 + i] = float(drift_.high[i] - airDriftOf_[airOld_].high[i]);
+    c.lean[i] = float(lean_[i]);
+    // For the final image: how much more the newest cloud image leans than the one
+    // before, which is faded into it.
+    c.lean[2 + i] = float(airLeanOf_[airNew_][i] - airLeanOf_[airOld_][i]);
+    c.surf[i] = float(surf_[i]), c.surf[2 + i] = float(seaDir_[i]);
+    c.gust[i] = float(fogT_[i]);
+  }
+  c.gust[2] = float(gustT_);
+  for (int i = 0; i < 4; i++) c.windVec[i] = float(windVec_[i]);
   c.land[0] = l.alt;
   c.land[1] = wx.closed;
   c.land[2] = 0.45f + par_.density;
@@ -1742,7 +1834,7 @@ void Renderer::pickStart() {
   target(t.rtv.Get(), N, 1);
   SkyC c;
   c = {};
-  fillSky(c, N, 1, 0, 0, 0, 0, 0, 0);
+  fillSky(c, N, 1, 0, 0, 0, 0, 0);
   c.span = float(SPAN);
   c.count = float(N);
   ctx_->UpdateSubresource(skyBuf_.Get(), 0, nullptr, &c, 0, 0);
@@ -1781,7 +1873,7 @@ void Renderer::pickStart() {
   for (int i = 0; best < 0 && i < N; i++) {
     if (open(i) > 0.97f) best = i;
   }
-  if (best >= 0) cloudT_ = (best + 0.5) / N * SPAN;
+  if (best >= 0) seek((best + 0.5) / N * SPAN);
   ctx_->Unmap(copy.Get(), 0);
 }
 
@@ -1790,10 +1882,10 @@ void Renderer::pickStart() {
 void Renderer::drawBase() {
   SkyC c;
   target(haze_.rtv.Get(), haze_.w, 1);
-  fillSky(c, haze_.w, 1, 0, 0, 0, 0, 0, 0);
+  fillSky(c, haze_.w, 1, 0, 0, 0, 0, 0);
   quad(psHaze_.Get());
   target(base_.rtv.Get(), base_.w, base_.h);
-  fillSky(c, base_.w, base_.h, 0, 0, 0, 0, 0, 0);
+  fillSky(c, base_.w, base_.h, 0, 0, 0, 0, 0);
   quad(psBase_.Get());
   target(nullptr, 1, 1);
 }
@@ -1813,11 +1905,13 @@ void Renderer::beginPass() {
   // The first pass after a user change with fewer steps, so that dragging the sun
   // stays smooth; the following ones refine it.
   pass_.steps = int(std::lround(CLOUD_STEPS * (first ? 0.6 : 1.0)));
-  pass_.shift = float(cloudT_);
+  pass_.drift = drift_;
   pass_.evolve = float(evolveT_);
   // The wind may change while the pass is under way (live weather): all its bands
   // get the clouds of the wind it began with.
   pass_.wind = std::clamp(par_.wind, 0.0f, 1.0f);
+  std::copy(windVec_, windVec_ + 4, pass_.windVec);
+  std::copy(lean_, lean_ + 2, pass_.lean);
   // Every pass shifts the sampling pattern so that the remainder after averaging
   // does not form a fixed grid.
   pass_.jit = 5.588238f * float(skyShot_ % 64);
@@ -1844,16 +1938,24 @@ void Renderer::airBand() {
   ctx_->RSSetState(rasterCut_.Get());
   ctx_->RSSetScissorRects(1, &cut);
   SkyC c;
-  fillSky(c, air_[n].w, air_[n].h, pass_.steps, pass_.shift, pass_.jit, pass_.subX, pass_.subY, 0);
-  double back = double(pass_.shift) - airShiftOf_[airNew_];
+  fillSky(c, air_[n].w, air_[n].h, pass_.steps, pass_.jit, pass_.subX, pass_.subY, 0);
+  // The clouds of this pass: where the wind had shifted them when it began, and
+  // how far since the newest image, from which the history is read.
+  const Drift& was = airDriftOf_[airNew_];
+  const double back[4] = {pass_.drift.low[0] - was.low[0], pass_.drift.low[1] - was.low[1], pass_.drift.high[0] - was.high[0],
+                          pass_.drift.high[1] - was.high[1]};
+  for (int i = 0; i < 2; i++) {
+    c.drift[i] = float(pass_.drift.low[i]), c.drift[2 + i] = float(pass_.drift.high[i]);
+    c.lean[i] = float(pass_.lean[i]);
+    // The clouds of the image that is read may lean differently: the history is
+    // looked up where they stood with that lean.
+    c.lean[2 + i] = float(pass_.lean[i] - airLeanOf_[airNew_][i]);
+  }
+  for (int i = 0; i < 4; i++) c.back[i] = float(back[i]), c.windVec[i] = float(pass_.windVec[i]);
   // After a jump of the shift there is no previous image that fits.
-  c.share = std::abs(back) > 0.5 ? 1.0f : pass_.share;
-  c.back = float(back);
+  c.share = std::hypot(back[0], back[1]) > 3200 ? 1.0f : pass_.share;
   c.evolve = pass_.evolve;
-  // The clouds of the image that is read may lean differently: the history is
-  // looked up where they stood with that lean.
   c.shape[3] = pass_.wind;
-  c.sea[3] = float(leanOf(pass_.wind) - airLeanOf_[airNew_]);
   ctx_->UpdateSubresource(skyBuf_.Get(), 0, nullptr, &c, 0, 0);
   ID3D11ShaderResourceView* in[5] = {noise_.Get(), air_[airNew_].srv.Get(), nullptr, airZ_[airNew_].srv.Get(), base_.srv.Get()};
   ctx_->PSSetShaderResources(0, 5, in);
@@ -1868,7 +1970,7 @@ void Renderer::airBand() {
 void Renderer::drawNear(int image) {
   SkyC c;
   target(nearBlock_.rtv.Get(), nearBlock_.w, nearBlock_.h);
-  fillSky(c, nearBlock_.w, nearBlock_.h, 0, 0, 0, 0, 0, 0);
+  fillSky(c, nearBlock_.w, nearBlock_.h, 0, 0, 0, 0, 0);
   ctx_->PSSetShaderResources(3, 1, airZ_[image].srv.GetAddressOf());
   quad(psNearBlock_.Get());
   target(near_[image].rtv.Get(), near_[image].w, near_[image].h);
@@ -1897,13 +1999,13 @@ void Renderer::bindClouds() {
 // every finished image of the frame reads it.
 void Renderer::ensureFlow() {
   bool fading = fade_ < 0.999f;
-  if (flowSerial_ == airSerial_ && flowShift_ == cloudT_ && flowFading_ == fading) return;
-  flowSerial_ = airSerial_, flowShift_ = cloudT_, flowFading_ = fading;
+  if (flowSerial_ == airSerial_ && flowDrift_ == drift_ && flowFading_ == fading) return;
+  flowSerial_ = airSerial_, flowDrift_ = drift_, flowFading_ = fading;
   ID3D11ShaderResourceView* none = nullptr;
   ctx_->PSSetShaderResources(29, 1, &none);
   SkyC c;
   target(flow_.rtv.Get(), flow_.w, flow_.h);
-  fillSky(c, flow_.w, flow_.h, 0, float(cloudT_), 0, 0, 0, 0);
+  fillSky(c, flow_.w, flow_.h, 0, 0, 0, 0, 0);
   bindCloudImages();
   quad(psFlow_.Get());
   target(nullptr, 1, 1);
@@ -1915,11 +2017,9 @@ void Renderer::ensureFlow() {
 // rainRate in the shaders, from the weather map in memory.
 float Renderer::cloudDensity(double x, double z) const {
   if (weatherW_ <= 0) return 0;
-  double shift = cloudT_ * CLOUD_TILE;
-  // The clouds lean with the wind (cloudLean in clouds.hlsli): what is 400 m
+  // The clouds lean with the wind (cloudWeather in clouds.hlsli): what is 400 m
   // above the cloud base belongs to the column that far upwind.
-  double lean = leanOf(par_.wind) * (1150 - 750);
-  double u = (x + shift + 0.958 * lean) / 100e3, v = (z + shift * 0.3 + 0.287 * lean) / 100e3;
+  double u = (x + drift_.low[0] - lean_[0] * (1150 - 750)) / 100e3, v = (z + drift_.low[1] - lean_[1] * (1150 - 750)) / 100e3;
   u = (u - std::floor(u)) * weatherW_ - 0.5;
   v = (v - std::floor(v)) * weatherH_ - 0.5;
   int x0 = int(std::floor(u)), y0 = int(std::floor(v));
@@ -1962,7 +2062,7 @@ void Renderer::updateWeather(double dt, bool snap) {
   // farther; beyond three times the height of fall the slant is capped, as in the
   // image.
   double carried = std::min(surfSpeed() / fallSpeed(), 3.0) * (750.0 + GROUNDS[groundOf(par_)].cloudLift);
-  float shower = float(smooth(0.62 - 0.32 * wx.rain, 0.95 - 0.2 * wx.rain, cloudDensity(-SURF_X * carried, -SURF_Z * carried)));
+  float shower = float(smooth(0.62 - 0.32 * wx.rain, 0.95 - 0.2 * wx.rain, cloudDensity(-surf_[0] * carried, -surf_[1] * carried)));
   float want = wx.rain * (shower + (1 - shower) * 0.3f * wx.rain);
   rainHere_ = snap ? want : rainHere_ + (want - rainHere_) * float(std::min(1.0, dt / 2.5));
 }
@@ -2162,7 +2262,7 @@ void Renderer::drawBolt() {
     SkyC c;
     target(s.to->rtv.Get(), s.to->w, s.to->h);
     ctx_->ClearRenderTargetView(s.to->rtv.Get(), black);
-    fillSky(c, s.to->w, s.to->h, 0, 0, 0, 0, 0, 0);
+    fillSky(c, s.to->w, s.to->h, 0, 0, 0, 0, 0);
     ctx_->VSSetConstantBuffers(0, 1, skyBuf_.GetAddressOf());
     ctx_->VSSetConstantBuffers(2, 1, boltBuf_.GetAddressOf());
     ctx_->OMSetBlendState(blendMax_.Get(), nullptr, 0xffffffff);
@@ -2643,7 +2743,7 @@ void Renderer::makeWaves() {
   };
   auto gauss = [&] { return (rnd() + rnd() + rnd() + rnd() - 2) * 1.732f; };
   const double shortest = 0.07, longest = 1.6 * g.peak[2];
-  const double wind = std::atan2(SURF_X, SURF_Z), swell = 2.75;
+  const double wind = std::atan2(seaDir_[0], seaDir_[1]), swell = 2.75;
   const int sea = WAVES - SWELL;
   for (int i = 0; i < WAVES; i++) {
     double lambda, theta;
@@ -2717,7 +2817,7 @@ void Renderer::drawRain(bool fresh) {
   SkyC c;
   for (int round = 0; round < (fresh ? 6 : 1); round++) {
     target(rain_[next].rtv.Get(), rain_[next].w, rain_[next].h);
-    fillSky(c, rain_[next].w, rain_[next].h, 0, float(cloudT_), 5.588238f * float(rainShot_++ % 64), 0, 0, 0);
+    fillSky(c, rain_[next].w, rain_[next].h, 0, 5.588238f * float(rainShot_++ % 64), 0, 0, 0);
     c.share = fresh && round == 0 ? 1.0f : 0.25f;
     ctx_->UpdateSubresource(skyBuf_.Get(), 0, nullptr, &c, 0, 0);
     ctx_->PSSetShaderResources(0, 1, noise_.GetAddressOf());
@@ -2758,7 +2858,7 @@ void Renderer::drawWaterMaps(bool sums, bool shade) {
   SkyC c;
   if (sums) {
     target(columnBlock_.rtv.Get(), column_.w, column_.h);
-    fillSky(c, column_.w, column_.h, 0, float(cloudT_), 0, 0, 0, 0);
+    fillSky(c, column_.w, column_.h, 0, 0, 0, 0, 0);
     ctx_->PSSetShaderResources(19, 1, upper_.srv.GetAddressOf());
     quad(psColumnBlock_.Get());
     target(column_.rtv.Get(), column_.w, column_.h);
@@ -2772,7 +2872,7 @@ void Renderer::drawWaterMaps(bool sums, bool shade) {
   }
   if (shade) {
     target(shade_.rtv.Get(), shade_.w, shade_.h);
-    fillSky(c, shade_.w, shade_.h, 0, float(cloudT_), 0, 0, 0, 0);
+    fillSky(c, shade_.w, shade_.h, 0, 0, 0, 0, 0);
     ctx_->PSSetShaderResources(0, 1, noise_.GetAddressOf());
     ID3D11ShaderResourceView* clouds[4] = {shape_.Get(), detail_.Get(), weather_.Get(), turb_.Get()};
     ctx_->PSSetShaderResources(5, 4, clouds);
@@ -2870,6 +2970,27 @@ bool Renderer::allocProps() {
   d.BindFlags = D3D11_BIND_DEPTH_STENCIL;
   if (FAILED(dev_->CreateTexture2D(&d, nullptr, &propDepth_)) || FAILED(dev_->CreateDepthStencilView(propDepth_.Get(), nullptr, &propDsv_))) return false;
   propSamples_ = int(count);
+  // The shadow map. Without it the models are drawn without their own shadows.
+  D3D11_TEXTURE2D_DESC s = {};
+  s.Width = s.Height = SHADOW_SIZE;
+  s.MipLevels = s.ArraySize = 1;
+  s.Format = DXGI_FORMAT_R32_TYPELESS;
+  s.SampleDesc.Count = 1;
+  s.Usage = D3D11_USAGE_DEFAULT;
+  s.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+  ComPtr<ID3D11Texture2D> shadow;
+  D3D11_DEPTH_STENCIL_VIEW_DESC dv = {};
+  dv.Format = DXGI_FORMAT_D32_FLOAT;
+  dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+  sv.Format = DXGI_FORMAT_R32_FLOAT;
+  sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  sv.Texture2D.MipLevels = 1;
+  if (FAILED(dev_->CreateTexture2D(&s, nullptr, &shadow)) || FAILED(dev_->CreateDepthStencilView(shadow.Get(), &dv, &shadowDsv_)) ||
+      FAILED(dev_->CreateShaderResourceView(shadow.Get(), &sv, &shadowSrv_))) {
+    shadowDsv_.Reset();
+    shadowSrv_.Reset();
+  }
   return true;
 }
 
@@ -2883,7 +3004,7 @@ bool Renderer::updateLife(double dt) {
   s.water = g.water;
   s.eye = g.eyeWater;
   s.wind = surfSpeed() * (g.water ? g.shelter : 1.0f);
-  s.windX = SURF_X, s.windZ = SURF_Z;
+  s.windX = seaDir_[0], s.windZ = seaDir_[1];
   s.night = light_.night;
   s.rain = skyOf(par_.clouds).rain;
   s.fog = par_.fog;
@@ -3004,12 +3125,42 @@ void Renderer::drawProps(Into into, ID3D11RenderTargetView* rtv, int w, int h) {
     c.light[3] = g.water ? 0.12f : 0.22f;
     c.wing[0] = p.wing, c.wing[1] = p.tip, c.wing[2] = m.wing[0], c.wing[3] = m.wing[1];
     c.axis[0] = m.wing[2], c.axis[1] = p.mirrored ? 1.0f : 0.0f;
+    // Its shadow map reaches around its origin as far as the farthest corner of
+    // its extent, and the wings beyond.
+    double reach = 0;
+    for (int i = 0; i < 3; i++) reach += std::max(m.lo[i] * m.lo[i], m.hi[i] * m.hi[i]);
+    c.shade[0] = shadowDsv_ ? float(std::sqrt(reach) + m.wing[1]) : 0.0f;
+    // A ship under way heaps up water at its stem, about half as high as the speed
+    // would throw it; a slow boat hardly any.
+    if (model.afloat && g.water && p.speed > 1) {
+      double v = p.speed;
+      c.shade[1] = float(0.5 * v * v / (2 * 9.81) * std::min((v - 1) / 6, 1.0));
+      c.shade[2] = m.hi[2];
+      c.shade[3] = 0.15f * (m.hi[2] - m.lo[2]);
+    }
     ctx_->UpdateSubresource(propBuf_.Get(), 0, nullptr, &c, 0, 0);
+
+    const UINT stride = MESH_VERTEX, offset = 0;
+    ID3D11ShaderResourceView* noShadow[1] = {};
+    ctx_->PSSetShaderResources(30, 1, noShadow);
+    if (c.shade[0] > 0) {
+      // Its shadow map: the model seen from the light source, depth only.
+      const D3D11_VIEWPORT map = {0, 0, float(SHADOW_SIZE), float(SHADOW_SIZE), 0, 1};
+      ctx_->OMSetRenderTargets(0, nullptr, shadowDsv_.Get());
+      ctx_->ClearDepthStencilView(shadowDsv_.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+      ctx_->RSSetViewports(1, &map);
+      ctx_->RSSetState(raster_.Get());
+      ctx_->IASetInputLayout(propLayout_.Get());
+      ctx_->IASetVertexBuffers(0, 1, m.vertices.GetAddressOf(), &stride, &offset);
+      ctx_->IASetIndexBuffer(m.indices.Get(), DXGI_FORMAT_R32_UINT, 0);
+      ctx_->VSSetShader(vsPropShadow_.Get(), nullptr, 0);
+      ctx_->PSSetShader(nullptr, nullptr, 0);
+      ctx_->DrawIndexed(m.count, 0, 0);
+    }
 
     // The model alone.
     const float clear[4] = {};
     const D3D11_VIEWPORT part = {0, 0, float(bw * fine), float(bh * fine), 0, 1};
-    const UINT stride = MESH_VERTEX, offset = 0;
     ctx_->PSSetShaderResources(26, 1, none);
     ctx_->OMSetRenderTargets(1, propRtv_.GetAddressOf(), propDsv_.Get());
     ctx_->ClearRenderTargetView(propRtv_.Get(), clear);
@@ -3023,7 +3174,9 @@ void Renderer::drawProps(Into into, ID3D11RenderTargetView* rtv, int w, int h) {
     ctx_->VSSetShader(vsProp_.Get(), nullptr, 0);
     ctx_->PSSetShader(psPropIn_.Get(), nullptr, 0);
     ctx_->PSSetShaderResources(25, 1, m.colors.GetAddressOf());
+    if (c.shade[0] > 0) ctx_->PSSetShaderResources(30, 1, shadowSrv_.GetAddressOf());
     ctx_->DrawIndexed(m.count, 0, 0);
+    ctx_->PSSetShaderResources(30, 1, noShadow);
 
     // Laid over the target.
     ctx_->OMSetRenderTargets(1, &rtv, nullptr);
@@ -3084,7 +3237,7 @@ void Renderer::faceUpper() {
   ctx_->PSSetShaderResources(19, 1, none);
   SkyC c;
   target(upper_.rtv.Get(), upper_.w, upper_.h);
-  fillSky(c, upper_.w, upper_.h, 0, float(cloudT_), 0, 0, 0, 0);
+  fillSky(c, upper_.w, upper_.h, 0, 0, 0, 0, 0);
   c.pass = 1;
   ctx_->UpdateSubresource(skyBuf_.Get(), 0, nullptr, &c, 0, 0);
   bindClouds();
@@ -3110,7 +3263,7 @@ void Renderer::faceForLight() {
   }
   SkyC c;
   target(sky_.rtv.Get(), sky_.w, sky_.h);
-  fillSky(c, sky_.w, sky_.h, 0, float(cloudT_), 0, 0, 0, 0);
+  fillSky(c, sky_.w, sky_.h, 0, 0, 0, 0, 0);
   bindClouds();
   bindGround(water);
   quad(psFace_.Get());
@@ -3165,7 +3318,7 @@ bool Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo, int band) {
       ctx_->RSSetState(rasterCut_.Get());
       ctx_->RSSetScissorRects(1, &cut);
     }
-    fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
+    fillSky(c, pixW_, pixH_, 0, 0, 0, 0, 1);
     bindClouds();
     bindGround(g.water);
     quad(psFace_.Get());
@@ -3176,7 +3329,7 @@ bool Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo, int band) {
   ctx_->CopyResource(out.Get(), eye_.tex.Get());
   if (props_.empty()) return true;
   target(skyOut, pixW_, pixH_);
-  fillSky(c, pixW_, pixH_, 0, float(cloudT_), 0, 0, 0, 1);
+  fillSky(c, pixW_, pixH_, 0, 0, 0, 0, 1);
   bindClouds();
   bindGround(g.water);
   drawProps(Into::EYE, skyOut, pixW_, pixH_);
@@ -3198,8 +3351,8 @@ bool Renderer::stepBand() {
   airBand();
   if (pass_.band < AIR_BANDS) return false;
   drawNear(airWork_);
-  airShiftOf_[airWork_] = pass_.shift;
-  airLeanOf_[airWork_] = leanOf(pass_.wind);
+  airDriftOf_[airWork_] = pass_.drift;
+  airLeanOf_[airWork_][0] = pass_.lean[0], airLeanOf_[airWork_][1] = pass_.lean[1];
   airSerial_++;
   int oldest = airOld_;
   airOld_ = airNew_;
@@ -3552,23 +3705,31 @@ Renderer::World Renderer::drawWorld(ID3D11RenderTargetView* skyOut, bool alive, 
   owed_ = 0;
   worldTime_ = time_;
 
-  bool drifting = par_.wind > 0 && par_.clouds > 0;
+  bool drifting = par_.wind > 0 && (par_.clouds > 0 || par_.cirrus > 0);
   if (drifting) {
-    cloudT_ += dt * par_.wind * WIND_MAX / CLOUD_TILE;
-    // After 625 tiles weather map and noise are exactly the same again, for the wind
-    // below as for the one above: there the shift wraps, and everything that has
-    // stored a state wraps with it.
-    if (cloudT_ >= CLOUD_WRAP) {
-      cloudT_ -= CLOUD_WRAP;
-      for (double& at : airShiftOf_) at -= CLOUD_WRAP;
-      pass_.shift -= float(CLOUD_WRAP);
-    }
+    double step = dt * par_.wind * WIND_MAX / CLOUD_TILE;
+    for (int i = 0; i < 2; i++) drift_.low[i] += step * windVec_[i], drift_.high[i] += step * windVec_[2 + i];
+    // After DRIFT_WRAP meters in either direction weather map and noise are exactly
+    // the same again: there the shift wraps, and everything that has stored a state
+    // wraps with it.
+    auto wrap = [&](bool high, int i) {
+      auto at = [&](Drift& d) -> double& { return high ? d.high[i] : d.low[i]; };
+      if (std::abs(at(drift_)) < DRIFT_WRAP) return;
+      double by = std::copysign(DRIFT_WRAP, at(drift_));
+      at(drift_) -= by;
+      at(pass_.drift) -= by;
+      for (Drift& d : airDriftOf_) at(d) -= by;
+    };
+    for (int i = 0; i < 2; i++) wrap(false, i), wrap(true, i);
     evolveT_ += dt * par_.wind * EVOLVE_MAX;
   }
   // The dust also moves with the wind at the ground; after 80 image widths it is
   // the same again.
-  double blow = std::clamp(double(par_.wind), 0.0, 1.0);
-  dustT_ = std::fmod(dustT_ + dt * (0.8 + 6 * blow + 14 * blow * blow), 80.0 * (viewW_ + 80.0));
+  // Across the image it moves with the part of the wind that blows across it.
+  double blow = std::clamp(double(par_.wind), 0.0, 1.0), across = -surf_[0] / 0.747;
+  double round = 80.0 * (viewW_ + 80.0);
+  dustT_ = std::fmod(dustT_ + dt * (0.8 + 6 * blow + 14 * blow * blow) * across, round);
+  if (dustT_ < 0) dustT_ += round;
 
   if (!started_ && viewW_ >= 480 && viewH_ >= 320) {
     pickStart();
@@ -3803,6 +3964,12 @@ Renderer::Drawn Renderer::render(double dt, ID3D11RenderTargetView* skyOut, ID3D
   time_ += dt;
   // The gust fields move over the water with the wind at the ground. Their path
   // wraps without anything jumping: 5000 m are three tiles of the noise.
+  // The banks of fog drift with it in its direction; the gust fields lie in axes
+  // along the waves and move along them. Both repeat after 5000 m.
+  for (int i = 0; i < 2; i++) {
+    fogT_[i] = std::fmod(fogT_[i] + dt * surfSpeed() * 0.8 * surf_[i], 5000.0);
+    if (fogT_[i] < 0) fogT_[i] += 5000.0;
+  }
   gustT_ = std::fmod(gustT_ + dt * surfSpeed() * 0.8, 5000.0);
 
   // Water moves fast enough that every display refresh is visible. Everything else

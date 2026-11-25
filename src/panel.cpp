@@ -156,9 +156,20 @@ void build(Panel& p) {
   Row clouds = with(slider(L"Clouds", &h.par->clouds, 0, 2, weather), fresh.clouds);
   clouds.locked = live;
   sky.push_back(clouds);
+  Row cirrus = with(slider(L"Cirrus", &h.par->cirrus, 0, 1), fresh.cirrus);
+  cirrus.locked = live;
+  sky.push_back(cirrus);
   Row wind = with(slider(L"Wind", &h.par->wind, 0, 1), fresh.wind);
   wind.locked = live;
   sky.push_back(wind);
+  // Where the wind comes from, as on a compass.
+  auto compass = [](float v) {
+    static const wchar_t* points[16] = {L"N", L"NNE", L"NE", L"ENE", L"E", L"ESE", L"SE", L"SSE", L"S", L"SSW", L"SW", L"WSW", L"W", L"WNW", L"NW", L"NNW"};
+    return std::wstring(points[int(std::lround(v / 22.5f)) & 15]);
+  };
+  Row from = with(slider(L"Wind from", &h.par->windDir, 0, 360, compass, 1), fresh.windDir);
+  from.locked = live;
+  sky.push_back(from);
   // Fog and temperature: what was set by hand, or with live weather what the
   // image shows right now. The temperature at its left end follows the season.
   if (h.fog && h.temperature) {
@@ -759,8 +770,11 @@ void openPanel(HINSTANCE inst, const PanelHost& host) {
     c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     c.lpfnWndProc = panelProc;
     c.lpszClassName = PANEL_CLASS;
-    c.hIcon = host.icon;
-    c.hIconSm = host.icon;
+    // The program icon, if it is there; otherwise the drawn sun of the tray.
+    HICON big = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+    HICON little = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    c.hIcon = big ? big : host.icon;
+    c.hIconSm = little ? little : host.icon;
     RegisterClassExW(&c);
     registered = true;
   }
