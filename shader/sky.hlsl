@@ -95,6 +95,7 @@ Texture2D tBoltFar : register(t22); // its wide glow, at a quarter of the edge l
 Texture2D tShade : register(t23);   // shadow of the clouds on the water: what they transmit there of the light source's light
 Texture2D tColumn : register(t24);  // the strip above the horizon, summed from top to bottom (see Column)
 Texture2D tNight : register(t27);   // the night sky: Milky Way, stars, planets, shooting stars; their light as it enters the image
+Texture2D tFlow : register(t29);    // where what is now in the cloud image was in the stored ones (see Flow)
 
 static float cloudShift;   // shift of the clouds by the wind, in tiles
 static float cloudAge;     // time by which their shapes change
@@ -350,12 +351,37 @@ float3 driftOf(float3 d, float z, float back, float lean) {
   return was;
 }
 
-float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float back, float lean, out float zOld) {
+// The distance z of what is now in view direction d, found by fixed point: the
+// cloud at the place it came from, with that distance, until it no longer
+// changes. Returns whether there was a cloud at about the starting distance at
+// each step.
+bool settle(Texture2D zTex, float3 d, float back, float lean, inout float z) {
+  bool same = true;
+  [unroll] for (int k = 0; k < 3; k++) {
+    float3 Q = d * (z * 1000.0) + driftOf(d, z, back, lean);
+    float zq = Q.z > 1.0 ? depthAt(zTex, airUv(pointOf(Q))) : 0.0;
+    same = same && zq > 0.0 && abs(zq - z) < 0.3 * z;
+    z = same ? zq : z;
+  }
+  return same;
+}
+
+// empty: it is known that there is no cloud here now (the pass in progress has
+// found none). Then nothing can have moved in, and the search for what might
+// have (below) would only carry clouds into open sky: what was here before is
+// still here (open sky), or it was a cloud that has moved on, and then it is
+// looked up with its own distance. If that cloud was not where it came from,
+// there is no valid history: returns a position outside the image.
+float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z, float back, float lean, bool empty, out float zOld) {
   zOld = z;
   if ((abs(back) < 1e-7 && abs(lean) < 1e-6) || d.y <= 0.004) return uv;
-  if (z <= 0.0) {
-    z = depthAt(nearTex, uv);
-    if (z <= 0.0) {
+  if (z <= 0.0 && empty) {
+    z = depthAt(zTex, uv);
+    if (z <= 0.0) return uv;
+    if (!settle(zTex, d, back, lean, z)) return float2(-1.0, -1.0);
+  } else if (z <= 0.0) {
+    float zNear = depthAt(nearTex, uv);
+    if (zNear <= 0.0) {
       // No cloud known far and wide. Whatever may be here is hardly visible; it still
       // moves along, estimated with the mean height of the layer. If it stood still
       // while everything beside it moves, the boundary in between would appear as a
@@ -363,14 +389,55 @@ float2 cloudFrom(Texture2D zTex, Texture2D nearTex, float2 uv, float3 d, float z
       float3 o = float3(0.0, R_PLANET + EYE_ALT - uCloudLift, 0.0);
       z = raySphere(o, d, R_PLANET + EYE_ALT + 1300.0).y * 0.001;
     } else {
-      float3 N = d * (z * 1000.0) + driftOf(d, z, back, lean);
-      if (N.z <= 1.0) return float2(-1.0, -1.0);
-      float zn = length(N) * 0.001, zs = depthAt(zTex, airUv(pointOf(N)));
-      if (!(zs > 0.0 && abs(zs - zn) < 0.3 * zn)) {
-        // The front cloud was not there at all. Then this position shows what was
-        // already here before: a more distant cloud that moves more slowly.
-        float zf = depthAt(zTex, uv);
-        if (zf > 0.0) z = zf;
+      // Something may have moved in over this position. Whatever it is, it came from
+      // the line upwind of it: from far up close for a distant cloud, from farther
+      // away for a near one. Along that line, from near to far, the cloud that lies
+      // there is a candidate; it is what is here now if, at the place it came from
+      // with its own distance, there was that same cloud (fixed point). The nearest
+      // such one covers the others. The line is searched through the layer of the
+      // cumulus as this view ray crosses it, and at the cirrus. Started from the
+      // frontmost cloud of the neighborhood instead, which is the same over a whole
+      // block of pixels, the outcome followed those blocks: where a more distant
+      // cloud had moved in there stood a hole, and its outline was a row of steps.
+      // Only needed where a cloud nearer than what was here lies around: nothing else
+      // can have moved in over it. Everywhere else what was here simply moves on
+      // with its own distance; that is the same outcome for a fraction of the cost.
+      float zf = depthAt(zTex, uv);
+      bool found = false;
+      if (zf > 0.0 && zNear > 0.8 * zf) {
+        z = zf;
+        found = settle(zTex, d, back, lean, z);
+      }
+      float3 o = float3(0.0, R_PLANET + EYE_ALT - uCloudLift, 0.0);
+      float tLo = raySphere(o, d, R_PLANET + EYE_ALT + CUMULUS_LO).y * 0.001;
+      float tHi = min(raySphere(o, d, R_PLANET + EYE_ALT + CUMULUS_HI).y, CL_FAR) * 0.001;
+      float tCi = raySphere(o, d, R_PLANET + EYE_ALT + 0.5 * (LAYER_LO.z + LAYER_HI.z)).y * 0.001;
+      float ratio = tHi / max(tLo, 1e-3);
+      uint tw, th;
+      zTex.GetDimensions(tw, th);
+      int2 last = int2(tw, th) - 1;
+      // Four points through the cumulus, one at the cirrus. Whether a cloud lies at a
+      // point is read from the nearest pixel alone; only the check reads smoothly.
+      [loop] for (int i = 0; i < 5; i++) {
+        if (!found) {
+          float zi = i < 4 && tLo < tHi ? tLo * exp2(log2(max(ratio, 1.0)) * float(i) / 3.0) : tCi;
+          float3 S = d * (zi * 1000.0) + driftOf(d, zi, back, lean);
+          float zc = 0.0;
+          if (S.z > 1.0) zc = zTex.Load(int3(clamp(int2(airUv(pointOf(S)) * float2(tw, th)), int2(0, 0), last), 0)).r;
+          if (zc > 0.0 && settle(zTex, d, back, lean, zc)) {
+            z = zc;
+            found = true;
+          }
+        }
+      }
+      if (!found && zf > 0.0) {
+        // Nothing has moved in. Then this position shows what was already here
+        // before: a more distant cloud that moves more slowly.
+        z = zf;
+        settle(zTex, d, back, lean, z);
+      } else if (!found) {
+        // Nothing here before either: open sky, which moves with the cloud beside it.
+        z = zNear;
       }
     }
   }
@@ -492,7 +559,7 @@ AirOut Air(float4 pos : SV_Position) {
     // The history is looked up for the center of the pixel, not for the offset
     // sample of this pass: otherwise it would be read shifted by a fraction on every
     // pass and would blur over time.
-    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, uSea.w, zOld);
+    float2 uvOld = cloudFrom(tCloudZ, tNear, uv, dirOf(airPoint(uv)), zNow, uBack, uSea.w, zNow <= 0.0, zOld);
     if (uvOld.x > 0.0 && uvOld.y > 0.0 && uvOld.x < 1.0 && uvOld.y < 1.0) {
       was = cloudSharp(uvOld);
       zWas = depthAt(tCloudZ, uvOld);
@@ -708,10 +775,25 @@ float snowFall(float2 p) {
 // They are where the wind has carried them since their pass. When a new pass
 // arrives, it fades in over the duration of the next one: this way the image
 // changes steadily instead of jumping with every pass.
-void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
+// Where in the stored cloud images what is now at each position of the cloud
+// image was: the newest (rg) and the one before it (ba), as offsets; below -1:
+// nowhere. Made once per frame at the resolution of the clouds (Flow) and read
+// smoothly by every finished image: the search in cloudFrom is too costly for
+// every pixel of each of them.
+float4 Flow(float4 pos : SV_Position) : SV_Target {
+  cloudShift = uCloudT;
+  float2 au = pos.xy / uRes;
+  float3 toward = dirOf(airPoint(au));
   float zThere;
+  float2 a = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, 0.0, false, zThere);
+  float2 b = uFade < 0.999 ? cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, uSea.w, false, zThere) : au;
+  return float4(a.x < 0.0 ? float2(-9.0, -9.0) : a - au, b.x < 0.0 ? float2(-9.0, -9.0) : b - au);
+}
+
+void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   float2 au = airUv(p);
-  float2 from = cloudFrom(tCloudZ, tNear, au, toward, 0.0, uBack, 0.0, zThere);
+  float4 flow = tFlow.SampleLevel(sClamp, au, 0.0);
+  float2 from = flow.x < -1.0 ? float2(-1.0, -1.0) : au + flow.xy;
   cloud = tCloud.SampleLevel(sClamp, from, 0.0);
   // Distance of the clouds at this position in km, 0 = none: by this they lie in
   // front of or behind the land.
@@ -720,8 +802,9 @@ void cloudsAt(float2 p, float3 toward, out float4 cloud, out float2 cloudZ) {
   if (cloudZ.x <= 0.0) cloudZ = float2(tNear.SampleLevel(sClamp, from, 0.0).r, 0.0);
   if (uFade < 0.999) {
     // The image before may have been made in a different wind: its clouds are set
-    // to the lean of the newest one, so that the two fade into each other in place.
-    from = cloudFrom(tCloudZOld, tNearOld, au, toward, 0.0, uBackOld, uSea.w, zThere);
+    // to the lean of the newest one, so that the two fade into each other in place
+    // (see Flow).
+    from = flow.z < -1.0 ? float2(-1.0, -1.0) : au + flow.zw;
     float4 older = tCloudOld.SampleLevel(sClamp, from, 0.0);
     float2 zOlder = depthSoft(tCloudZOld, from);
     if (zOlder.x <= 0.0) zOlder = float2(tNearOld.SampleLevel(sClamp, from, 0.0).r, 0.0);

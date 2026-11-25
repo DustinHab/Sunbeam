@@ -22,6 +22,7 @@ set FXC=fxc /nologo /O2
 %FXC% /T ps_5_0 /E Air         /Vn sh_air         /Fh out\sh\air.h         shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Near        /Vn sh_near        /Fh out\sh\near.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E NearBlock   /Vn sh_nearblock   /Fh out\sh\nearblock.h   shader\sky.hlsl >nul || goto failed
+%FXC% /T ps_5_0 /E Flow        /Vn sh_flow        /Fh out\sh\flow.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Base        /Vn sh_base        /Fh out\sh\base.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Haze        /Vn sh_haze        /Fh out\sh\haze.h        shader\sky.hlsl >nul || goto failed
 %FXC% /T ps_5_0 /E Face        /Vn sh_face        /Fh out\sh\face.h        shader\sky.hlsl >nul || goto failed

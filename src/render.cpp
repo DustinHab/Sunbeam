@@ -37,6 +37,7 @@
 #include "sh/trailvs.h"
 #include "sh/wholevs.h"
 #include "sh/near.h"
+#include "sh/flow.h"
 #include "sh/nearblock.h"
 #include "sh/noise.h"
 #include "sh/pick.h"
@@ -621,6 +622,7 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context) {
   pixel(sh_boltfar, sizeof(sh_boltfar), psBoltFar_);
   pixel(sh_near, sizeof(sh_near), psNear_);
   pixel(sh_nearblock, sizeof(sh_nearblock), psNearBlock_);
+  pixel(sh_flow, sizeof(sh_flow), psFlow_);
   pixel(sh_scatter, sizeof(sh_scatter), psScatter_);
   pixel(sh_far, sizeof(sh_far), psFar_);
   pixel(sh_resolve, sizeof(sh_resolve), psResolve_);
@@ -1099,6 +1101,9 @@ void Renderer::resize(int pixelW, int pixelH, float scale) {
     airLeanOf_[i] = leanOf(par_.wind);
   }
   nearBlock_ = makeTarget((aw + 3) / 4, (ah + 3) / 4, DXGI_FORMAT_R16_FLOAT, false);
+  // Offsets, small numbers: half precision is enough for them.
+  flow_ = makeTarget(aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT, false);
+  flowSerial_ = -1;
   airNew_ = 0, airOld_ = 2, airWork_ = 1;
   airDone_ = 0;
   int hw = std::max(2, pixW_ / 2), hh = std::max(2, pixH_ / 2);
@@ -1873,13 +1878,36 @@ void Renderer::drawNear(int image) {
 }
 
 // The cloud images for the finished image: the newest and the one before.
-void Renderer::bindClouds() {
+void Renderer::bindCloudImages() {
   ID3D11ShaderResourceView* in[5] = {noise_.Get(), air_[airNew_].srv.Get(), haze_.srv.Get(), airZ_[airNew_].srv.Get(), base_.srv.Get()};
   ctx_->PSSetShaderResources(0, 5, in);
   ID3D11ShaderResourceView* more[4] = {near_[airNew_].srv.Get(), air_[airOld_].srv.Get(), near_[airOld_].srv.Get(), airZ_[airOld_].srv.Get()};
   ctx_->PSSetShaderResources(9, 4, more);
-  // Behind them the night sky.
+}
+
+void Renderer::bindClouds() {
+  bindCloudImages();
+  // Behind them the night sky; and where each part of them is now.
   ctx_->PSSetShaderResources(27, 1, stars_.srv.GetAddressOf());
+  ctx_->PSSetShaderResources(29, 1, flow_.srv.GetAddressOf());
+}
+
+// Where what is now in the cloud image was in the two stored ones (Flow in
+// sky.hlsl). Made anew when the clouds have moved on or a pass has finished;
+// every finished image of the frame reads it.
+void Renderer::ensureFlow() {
+  bool fading = fade_ < 0.999f;
+  if (flowSerial_ == airSerial_ && flowShift_ == cloudT_ && flowFading_ == fading) return;
+  flowSerial_ = airSerial_, flowShift_ = cloudT_, flowFading_ = fading;
+  ID3D11ShaderResourceView* none = nullptr;
+  ctx_->PSSetShaderResources(29, 1, &none);
+  SkyC c;
+  target(flow_.rtv.Get(), flow_.w, flow_.h);
+  fillSky(c, flow_.w, flow_.h, 0, float(cloudT_), 0, 0, 0, 0);
+  bindCloudImages();
+  quad(psFlow_.Get());
+  target(nullptr, 1, 1);
+  mark("flow");
 }
 
 // Density of the cumulus above a place (meters from the viewer, x to the right,
@@ -3051,6 +3079,7 @@ void Renderer::drawProps(Into into, ID3D11RenderTargetView* rtv, int w, int h) {
 
 // Sky and land without water: the image that is reflected in the water.
 void Renderer::faceUpper() {
+  ensureFlow();
   ID3D11ShaderResourceView* none[1] = {};
   ctx_->PSSetShaderResources(19, 1, none);
   SkyC c;
@@ -3069,6 +3098,7 @@ void Renderer::faceUpper() {
 // From sky and clouds the finished image for the light. The clouds are where the
 // wind has carried them since their pass.
 void Renderer::faceForLight() {
+  ensureFlow();
   loadGround();
   bool water = GROUNDS[groundOf(par_)].water;
   if (water) {
@@ -3102,6 +3132,7 @@ void Renderer::faceForLight() {
 // Returns whether the target has received the image.
 bool Renderer::faceForEye(ID3D11RenderTargetView* skyOut, Redo redo, int band) {
   if (!skyOut) return true;
+  ensureFlow();
   loadGround();
   ComPtr<ID3D11Resource> out;
   skyOut->GetResource(&out);
@@ -3169,6 +3200,7 @@ bool Renderer::stepBand() {
   drawNear(airWork_);
   airShiftOf_[airWork_] = pass_.shift;
   airLeanOf_[airWork_] = leanOf(pass_.wind);
+  airSerial_++;
   int oldest = airOld_;
   airOld_ = airNew_;
   airNew_ = airWork_;

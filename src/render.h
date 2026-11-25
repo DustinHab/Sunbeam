@@ -381,7 +381,9 @@ class Renderer {
   void beginPass();
   void airBand();
   void drawNear(int image);
+  void bindCloudImages();
   void bindClouds();
+  void ensureFlow();
   float cloudDensity(double x, double z) const;
   void updateWeather(double dt, bool snap);
   void drawRain(bool fresh);
@@ -432,7 +434,7 @@ class Renderer {
   Microsoft::WRL::ComPtr<ID3D11Device> dev_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx_;
   Microsoft::WRL::ComPtr<ID3D11VertexShader> vsFull_, vsDust_, vsBolt_, vsBoltFar_, vsProp_;
-  Microsoft::WRL::ComPtr<ID3D11PixelShader> psNoise_, psAir_, psNear_, psNearBlock_, psBase_, psHaze_, psFace_, psPick_, psRain_, psShade_, psColumn_, psColumnBlock_, psBolt_, psBoltFar_, psScatter_, psBloomPre_,
+  Microsoft::WRL::ComPtr<ID3D11PixelShader> psNoise_, psAir_, psNear_, psNearBlock_, psFlow_, psBase_, psHaze_, psFace_, psPick_, psRain_, psShade_, psColumn_, psColumnBlock_, psBolt_, psBoltFar_, psScatter_, psBloomPre_,
       psBloomDown_, psBloomUp_, psComposite_, psFlash_, psDust_, psProp_, psPropIn_, psLamp_, psFar_, psResolve_;
   Microsoft::WRL::ComPtr<ID3D11ComputeShader> csVolume_;
   Microsoft::WRL::ComPtr<ID3D11SamplerState> clamp_, wrap_;
@@ -526,6 +528,12 @@ class Renderer {
   double airShiftOf_[3] = {};   // wind shift for which each of the images applies
   double airLeanOf_[3] = {};    // and how far its cumulus lean with the wind (tangent)
   double shapeMoved_ = -1e9;    // when the weather last changed the shapes of the clouds
+  // Where what is now in the cloud image was in the stored ones, and for which
+  // state of the clouds it was made.
+  Target flow_;
+  int airSerial_ = 0, flowSerial_ = -1;
+  double flowShift_ = 0;
+  bool flowFading_ = false;
   int airDone_ = 0;             // finished passes since the last user change
   int sinceSwitch_ = 0;         // frames since the last finished pass
   float fade_ = 1;              // fraction of the newest cloud image when cross-fading
